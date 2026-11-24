@@ -1,6 +1,10 @@
 use crate::collections::{FxHashMap, FxHashSet};
-use crate::{FontId, GlyphId, Pixels, PlatformTextSystem, Point, SharedString, Size, point, px};
+use crate::{
+    Bounds, Direction, FontId, GlyphId, Pixels, PlatformTextSystem, Point, SharedString, Size,
+    point, px, size,
+};
 use itertools::Itertools;
+use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::{
     borrow::Borrow,
@@ -14,6 +18,163 @@ use std::{
 };
 
 use super::LineWrapper;
+
+/// Paragraph base direction for UAX #9 bidirectional layout.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum BaseDirection {
+    /// Explicit left-to-right base direction.
+    #[default]
+    Ltr,
+    /// Explicit right-to-left base direction.
+    Rtl,
+    /// Resolve from the first strong directional character in the paragraph (fallback LTR).
+    AutoFirstStrong,
+}
+
+impl BaseDirection {
+    /// Converts to the optional `unicode_bidi::Level` passed to `BidiInfo::new`.
+    #[inline]
+    pub fn to_bidi_level(self) -> Option<unicode_bidi::Level> {
+        match self {
+            Self::Ltr => Some(unicode_bidi::Level::ltr()),
+            Self::Rtl => Some(unicode_bidi::Level::rtl()),
+            Self::AutoFirstStrong => None,
+        }
+    }
+}
+
+/// Caret affinity at a directional or soft-wrap boundary.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CaretAffinity {
+    /// Leading edge of the character starting at `offset`.
+    #[default]
+    Downstream,
+    /// Trailing edge of the character ending at `offset`.
+    Upstream,
+}
+
+/// A visually ordered directional run produced by UAX #9 reordering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BidiVisualRun {
+    /// Byte range within the original paragraph text.
+    pub byte_range: Range<usize>,
+    /// UAX #9 embedding level (even = LTR, odd = RTL).
+    pub bidi_level: u8,
+}
+
+/// Returns a leading directional mark (`\u{200E}` LRM or `\u{200F}` RLM) when
+/// an explicit `base_direction` disagrees with the first strong directional
+/// character of `text`. Returns `None` for `AutoFirstStrong` or when the text
+/// already resolves to the requested base direction.
+pub(crate) fn bidi_direction_override_mark(
+    text: &str,
+    base_direction: BaseDirection,
+) -> Option<char> {
+    let want_rtl = match base_direction {
+        BaseDirection::AutoFirstStrong => return None,
+        BaseDirection::Ltr => false,
+        BaseDirection::Rtl => true,
+    };
+    let (auto_dir, _) = resolve_paragraph_bidi_levels(text, BaseDirection::AutoFirstStrong);
+    if auto_dir.is_rtl() == want_rtl {
+        None
+    } else if want_rtl {
+        Some('\u{200F}')
+    } else {
+        Some('\u{200E}')
+    }
+}
+
+/// Removes any glyph produced for a prepended directional mark (`index < mark_len`)
+/// and rebases remaining glyph indices and x positions back onto the original text.
+pub(crate) fn strip_leading_direction_mark(
+    layout: &mut LineLayout,
+    mark_len: usize,
+    original_len: usize,
+) {
+    for run in &mut layout.runs {
+        run.glyphs.retain_mut(|glyph| {
+            if glyph.index < mark_len {
+                false
+            } else {
+                glyph.index -= mark_len;
+                true
+            }
+        });
+    }
+    layout.runs.retain(|run| !run.glyphs.is_empty());
+    let min_x = layout
+        .runs
+        .iter()
+        .flat_map(|run| run.glyphs.iter().map(|g| g.position.x))
+        .fold(Pixels::MAX, Pixels::min);
+    if min_x != Pixels::MAX && min_x > Pixels::ZERO {
+        for glyph in layout.runs.iter_mut().flat_map(|run| &mut run.glyphs) {
+            glyph.position.x -= min_x;
+        }
+        layout.width = (layout.width - min_x).max(Pixels::ZERO);
+    }
+    layout.len = original_len;
+}
+
+/// Computes UAX #9 embedding levels across the entire paragraph `text`.
+///
+/// Always run this on the whole paragraph before splitting into styled or
+/// soft-wrapped visual runs so style boundaries never reset the base direction.
+pub fn resolve_paragraph_bidi_levels(
+    text: &str,
+    base_direction: BaseDirection,
+) -> (Direction, Vec<u8>) {
+    let bidi = unicode_bidi::BidiInfo::new(text, base_direction.to_bidi_level());
+    let resolved_dir = bidi
+        .paragraphs
+        .first()
+        .map(|p| {
+            if p.level.is_rtl() {
+                Direction::Rtl
+            } else {
+                Direction::Ltr
+            }
+        })
+        .unwrap_or(match base_direction {
+            BaseDirection::Rtl => Direction::Rtl,
+            BaseDirection::Ltr | BaseDirection::AutoFirstStrong => Direction::Ltr,
+        });
+    let levels = bidi.levels.iter().map(|level| level.number()).collect();
+    (resolved_dir, levels)
+}
+
+/// Reorders `line_range` of a paragraph into visual left-to-right runs using
+/// whole-paragraph UAX #9 levels.
+pub fn reorder_line_visual_runs(
+    text: &str,
+    base_direction: BaseDirection,
+    line_range: Range<usize>,
+) -> Vec<BidiVisualRun> {
+    if line_range.is_empty() || text.is_empty() {
+        return Vec::new();
+    }
+    let bidi = unicode_bidi::BidiInfo::new(text, base_direction.to_bidi_level());
+    let Some(para) = bidi.paragraphs.first() else {
+        return Vec::new();
+    };
+    let clamped_start = line_range.start.min(text.len());
+    let clamped_end = line_range.end.min(text.len());
+    if clamped_start >= clamped_end {
+        return Vec::new();
+    }
+    let (levels, runs) = bidi.visual_runs(para, clamped_start..clamped_end);
+    runs.into_iter()
+        .filter(|range| !range.is_empty())
+        .map(|range| {
+            let level = levels.get(range.start).map_or(0, |lvl| lvl.number());
+            BidiVisualRun {
+                byte_range: range,
+                bidi_level: level,
+            }
+        })
+        .collect()
+}
 
 /// A laid out and styled line of text
 #[derive(Clone, Default, Debug)]
@@ -30,15 +191,27 @@ pub struct LineLayout {
     pub runs: Vec<ShapedRun>,
     /// The length of the line in utf-8 bytes
     pub len: usize,
+    /// Resolved paragraph base direction for this line.
+    pub base_direction: BaseDirection,
 }
 
-/// A run of text that has been shaped .
+/// A run of text that has been shaped.
 #[derive(Debug, Clone)]
 pub struct ShapedRun {
     /// The font id for this run
     pub font_id: FontId,
     /// The glyphs that make up this run
     pub glyphs: Vec<ShapedGlyph>,
+    /// UAX #9 bidi embedding level (even = LTR, odd = RTL).
+    pub bidi_level: u8,
+}
+
+impl ShapedRun {
+    /// Returns true when this run has an odd (RTL) bidi embedding level.
+    #[inline]
+    pub const fn is_rtl(&self) -> bool {
+        self.bidi_level % 2 == 1
+    }
 }
 
 /// A single glyph, ready to paint.
@@ -57,7 +230,127 @@ pub struct ShapedGlyph {
     pub is_emoji: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct VisualCluster {
+    byte_start: usize,
+    byte_end: usize,
+    x_start: Pixels,
+    x_end: Pixels,
+    bidi_level: u8,
+}
+
+impl VisualCluster {
+    #[inline]
+    fn is_rtl(self) -> bool {
+        self.bidi_level % 2 == 1
+    }
+
+    #[inline]
+    fn leading_x(self) -> Pixels {
+        if self.is_rtl() {
+            self.x_end
+        } else {
+            self.x_start
+        }
+    }
+
+    #[inline]
+    fn trailing_x(self) -> Pixels {
+        if self.is_rtl() {
+            self.x_start
+        } else {
+            self.x_end
+        }
+    }
+}
+
 impl LineLayout {
+    /// Builds visual left-to-right grapheme clusters with exact byte ranges and x spans.
+    fn visual_clusters(&self) -> Vec<VisualCluster> {
+        let mut unique_indices: Vec<usize> = self
+            .runs
+            .iter()
+            .flat_map(|run| run.glyphs.iter().map(|g| g.index))
+            .collect();
+        if unique_indices.is_empty() {
+            return Vec::new();
+        }
+        unique_indices.sort_unstable();
+        unique_indices.dedup();
+
+        let byte_end_for = |start: usize| -> usize {
+            match unique_indices.binary_search(&start) {
+                Ok(pos) => unique_indices.get(pos + 1).copied().unwrap_or(self.len),
+                Err(pos) => unique_indices.get(pos).copied().unwrap_or(self.len),
+            }
+            .max(start)
+        };
+
+        let mut clusters: Vec<VisualCluster> = Vec::with_capacity(unique_indices.len());
+        for run in &self.runs {
+            for glyph in &run.glyphs {
+                if let Some(last) = clusters.last_mut()
+                    && last.byte_start == glyph.index
+                    && last.bidi_level == run.bidi_level
+                {
+                    // Combining mark or multi-glyph cluster: keep the leftmost x_start.
+                    if glyph.position.x < last.x_start {
+                        last.x_start = glyph.position.x;
+                    }
+                    continue;
+                }
+                let byte_end = byte_end_for(glyph.index);
+                clusters.push(VisualCluster {
+                    byte_start: glyph.index,
+                    byte_end,
+                    x_start: glyph.position.x,
+                    x_end: glyph.position.x,
+                    bidi_level: run.bidi_level,
+                });
+            }
+        }
+
+        // Assign each visual cluster's x_end from the next visual cluster's x_start.
+        let count = clusters.len();
+        for i in 0..count {
+            let next_x = if i + 1 < count {
+                clusters[i + 1].x_start
+            } else {
+                self.width
+            };
+            clusters[i].x_end = next_x.max(clusters[i].x_start);
+        }
+        clusters
+    }
+
+    /// Stamps UAX #9 `bidi_level` onto every shaped run, splitting runs where the
+    /// embedding level changes so each `ShapedRun` has a single uniform level.
+    pub fn apply_bidi_levels(&mut self, text: &str, base_direction: BaseDirection) {
+        self.base_direction = base_direction;
+        if text.is_empty() || self.runs.is_empty() {
+            return;
+        }
+        let (_, levels) = resolve_paragraph_bidi_levels(text, base_direction);
+        let mut split_runs = Vec::with_capacity(self.runs.len());
+        for run in self.runs.drain(..) {
+            for glyph in run.glyphs {
+                let level = levels.get(glyph.index).copied().unwrap_or(0);
+                if let Some(last) = split_runs.last_mut().filter(|last: &&mut ShapedRun| {
+                    last.font_id == run.font_id && last.bidi_level == level
+                }) {
+                    last.glyphs.push(glyph);
+                } else {
+                    split_runs.push(ShapedRun {
+                        font_id: run.font_id,
+                        glyphs: vec![glyph],
+                        bidi_level: level,
+                    });
+                }
+            }
+        }
+        self.runs = split_runs;
+    }
+
     /// Add tracking once per shaped cluster, keeping mark glyphs with their base.
     pub(crate) fn apply_letter_spacing(&mut self, spacing: Pixels) {
         let mut last_index = None;
@@ -76,125 +369,334 @@ impl LineLayout {
         }
     }
 
-    /// The index for the character at the given x coordinate
-    pub fn index_for_x(&self, x: Pixels) -> Option<usize> {
-        if x >= self.width {
-            None
-        } else {
-            for run in self.runs.iter().rev() {
-                for glyph in run.glyphs.iter().rev() {
-                    if glyph.position.x <= x {
-                        return Some(glyph.index);
-                    }
-                }
+    /// Returns the caret x coordinate for `offset` using the requested [`CaretAffinity`].
+    ///
+    /// Safe for mixed LTR/RTL runs and multi-byte grapheme clusters.
+    pub fn caret_x_for_index(&self, offset: usize, affinity: CaretAffinity) -> Pixels {
+        let clusters = self.visual_clusters();
+        if clusters.is_empty() {
+            return Pixels::ZERO;
+        }
+        let clamped = offset.min(self.len);
+
+        if affinity == CaretAffinity::Upstream && clamped > 0 {
+            if let Some(cluster) = clusters.iter().find(|c| c.byte_end == clamped) {
+                return cluster.trailing_x();
             }
-            Some(0)
+            if let Some(cluster) = clusters
+                .iter()
+                .find(|c| clamped > c.byte_start && clamped <= c.byte_end)
+            {
+                return cluster.trailing_x();
+            }
+        }
+
+        // Downstream (or fallback): leading edge of the cluster covering `clamped`.
+        if let Some(cluster) = clusters
+            .iter()
+            .find(|c| clamped >= c.byte_start && clamped < c.byte_end)
+        {
+            return cluster.leading_x();
+        }
+
+        // At or past end of line: trailing edge of the cluster ending at `self.len`.
+        if let Some(cluster) = clusters.iter().find(|c| c.byte_end == self.len) {
+            return cluster.trailing_x();
+        }
+
+        match self.base_direction {
+            BaseDirection::Rtl => Pixels::ZERO,
+            BaseDirection::Ltr | BaseDirection::AutoFirstStrong => self.width,
         }
     }
 
-    /// closest_index_for_x returns the character boundary closest to the given x coordinate
-    /// (e.g. to handle aligning up/down arrow keys)
-    pub fn closest_index_for_x(&self, x: Pixels) -> usize {
-        let mut prev_index = 0;
-        let mut prev_x = px(0.);
-
-        for run in self.runs.iter() {
-            for glyph in run.glyphs.iter() {
-                if glyph.position.x >= x {
-                    if glyph.position.x - x < x - prev_x {
-                        return glyph.index;
-                    } else {
-                        return prev_index;
-                    }
-                }
-                prev_index = glyph.index;
-                prev_x = glyph.position.x;
-            }
+    /// Hit-tests `x` to the nearest grapheme cluster boundary and [`CaretAffinity`].
+    ///
+    /// Correctly maps odd-level RTL runs in reverse logical order.
+    pub fn index_for_x(&self, x: Pixels) -> (usize, CaretAffinity) {
+        let clusters = self.visual_clusters();
+        if clusters.is_empty() {
+            return (0, CaretAffinity::Downstream);
         }
 
-        if self.len == 1 {
-            if x > self.width / 2. {
-                return 1;
+        if x <= clusters[0].x_start {
+            let first = clusters[0];
+            return if first.is_rtl() {
+                (first.byte_end, CaretAffinity::Upstream)
             } else {
-                return 0;
+                (first.byte_start, CaretAffinity::Downstream)
+            };
+        }
+
+        if x >= self.width {
+            let last = *clusters.last().unwrap();
+            return if last.is_rtl() {
+                (last.byte_start, CaretAffinity::Downstream)
+            } else {
+                (last.byte_end, CaretAffinity::Upstream)
+            };
+        }
+
+        for cluster in &clusters {
+            if x >= cluster.x_start && x <= cluster.x_end {
+                let mid = (cluster.x_start + cluster.x_end) / 2.0;
+                return if x < mid {
+                    if cluster.is_rtl() {
+                        (cluster.byte_end, CaretAffinity::Upstream)
+                    } else {
+                        (cluster.byte_start, CaretAffinity::Downstream)
+                    }
+                } else if cluster.is_rtl() {
+                    (cluster.byte_start, CaretAffinity::Downstream)
+                } else {
+                    (cluster.byte_end, CaretAffinity::Upstream)
+                };
             }
         }
 
-        self.len
+        // Fallback to nearest cluster center if gaps exist between clusters.
+        let nearest = clusters
+            .iter()
+            .min_by(|a, b| {
+                let da = ((a.x_start + a.x_end) / 2.0 - x).abs();
+                let db = ((b.x_start + b.x_end) / 2.0 - x).abs();
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .copied()
+            .unwrap();
+        let mid = (nearest.x_start + nearest.x_end) / 2.0;
+        if x < mid {
+            if nearest.is_rtl() {
+                (nearest.byte_end, CaretAffinity::Upstream)
+            } else {
+                (nearest.byte_start, CaretAffinity::Downstream)
+            }
+        } else if nearest.is_rtl() {
+            (nearest.byte_start, CaretAffinity::Downstream)
+        } else {
+            (nearest.byte_end, CaretAffinity::Upstream)
+        }
     }
 
-    /// The x position of the character at the given index
-    pub fn x_for_index(&self, index: usize) -> Pixels {
-        for run in &self.runs {
-            for glyph in &run.glyphs {
-                if glyph.index >= index {
-                    return glyph.position.x;
-                }
+    /// Compatibility wrapper returning the cluster start byte index at `x`, or `None` past `width`.
+    pub fn legacy_index_for_x(&self, x: Pixels) -> Option<usize> {
+        if x >= self.width {
+            return None;
+        }
+        let clusters = self.visual_clusters();
+        for cluster in clusters.iter().rev() {
+            if cluster.x_start <= x {
+                return Some(cluster.byte_start);
             }
         }
-        self.width
+        Some(0)
+    }
+
+    /// Returns the grapheme boundary closest to `x`.
+    pub fn closest_index_for_x(&self, x: Pixels) -> usize {
+        self.index_for_x(x).0
+    }
+
+    /// Returns the x position of the character at `index` (downstream affinity).
+    pub fn x_for_index(&self, index: usize) -> Pixels {
+        self.caret_x_for_index(index, CaretAffinity::Downstream)
+    }
+
+    /// Returns visual selection rectangles for `range`.
+    ///
+    /// Selections that cross LTR and RTL runs return multiple disjoint rectangles,
+    /// while contiguous clusters in the same direction merge into a single rectangle.
+    pub fn selection_rects_for_range(&self, range: Range<usize>) -> SmallVec<[Bounds<Pixels>; 4]> {
+        let mut rects: SmallVec<[Bounds<Pixels>; 4]> = SmallVec::new();
+        if range.start >= range.end {
+            return rects;
+        }
+        let clusters = self.visual_clusters();
+        if clusters.is_empty() {
+            return rects;
+        }
+        let height = (self.ascent + self.descent).max(self.font_size);
+        let mut last_rtl: Option<bool> = None;
+
+        for cluster in clusters {
+            if cluster.byte_start < range.end && cluster.byte_end > range.start {
+                let width = (cluster.x_end - cluster.x_start).max(Pixels::ZERO);
+                if let Some(prev) = rects.last_mut()
+                    && last_rtl == Some(cluster.is_rtl())
+                    && (prev.origin.x + prev.size.width - cluster.x_start).abs() <= px(0.5)
+                {
+                    prev.size.width = (cluster.x_end - prev.origin.x).max(Pixels::ZERO);
+                } else {
+                    rects.push(Bounds::new(
+                        point(cluster.x_start, Pixels::ZERO),
+                        size(width, height),
+                    ));
+                    last_rtl = Some(cluster.is_rtl());
+                }
+            } else {
+                last_rtl = None;
+            }
+        }
+        rects
     }
 
     /// Split this layout at a byte index, returning `(prefix, suffix)`.
     ///
-    /// - `prefix` contains glyphs for bytes `[0, byte_index)` with original positions.
-    ///   Its width equals the x-advance up to the split point.
-    /// - `suffix` contains glyphs for bytes `[byte_index, len)` with positions
-    ///   shifted left so the first glyph starts at x=0, and byte indices rebased to 0.
-    /// - `font_size`, `ascent`, and `descent` are copied to both halves.
+    /// Preserves `bidi_level` on every run and handles non-monotonic RTL glyph indices.
     pub fn split_at(&self, byte_index: usize) -> (LineLayout, LineLayout) {
-        let x_offset = self.x_for_index(byte_index);
+        let byte_index = byte_index.min(self.len);
+        let is_monotonic_ltr = self.runs.iter().all(|r| !r.is_rtl())
+            && self
+                .runs
+                .iter()
+                .flat_map(|r| r.glyphs.iter().map(|g| g.index))
+                .is_sorted();
 
-        // Partition glyph runs. A single run may contribute glyphs to both halves.
+        if is_monotonic_ltr {
+            let x_offset = self.x_for_index(byte_index);
+            let mut left_runs = Vec::new();
+            let mut right_runs = Vec::new();
+            for run in &self.runs {
+                let split_pos = run.glyphs.partition_point(|g| g.index < byte_index);
+                if split_pos > 0 {
+                    left_runs.push(ShapedRun {
+                        font_id: run.font_id,
+                        glyphs: run.glyphs[..split_pos].to_vec(),
+                        bidi_level: run.bidi_level,
+                    });
+                }
+                if split_pos < run.glyphs.len() {
+                    let right_glyphs = run.glyphs[split_pos..]
+                        .iter()
+                        .map(|g| ShapedGlyph {
+                            id: g.id,
+                            position: point(g.position.x - x_offset, g.position.y),
+                            index: g.index - byte_index,
+                            is_emoji: g.is_emoji,
+                        })
+                        .collect();
+                    right_runs.push(ShapedRun {
+                        font_id: run.font_id,
+                        glyphs: right_glyphs,
+                        bidi_level: run.bidi_level,
+                    });
+                }
+            }
+            return (
+                LineLayout {
+                    font_size: self.font_size,
+                    width: x_offset,
+                    ascent: self.ascent,
+                    descent: self.descent,
+                    runs: left_runs,
+                    len: byte_index,
+                    base_direction: self.base_direction,
+                },
+                LineLayout {
+                    font_size: self.font_size,
+                    width: (self.width - x_offset).max(Pixels::ZERO),
+                    ascent: self.ascent,
+                    descent: self.descent,
+                    runs: right_runs,
+                    len: self.len - byte_index,
+                    base_direction: self.base_direction,
+                },
+            );
+        }
+
+        // Bidi-safe partitioning preserving visual order and compacting x coordinates.
+        let clusters = self.visual_clusters();
+        let cluster_width = |index: usize, level: u8| -> Pixels {
+            clusters
+                .iter()
+                .find(|c| c.byte_start == index && c.bidi_level == level)
+                .map_or(Pixels::ZERO, |c| c.x_end - c.x_start)
+        };
+
         let mut left_runs = Vec::new();
         let mut right_runs = Vec::new();
+        let mut left_x = Pixels::ZERO;
+        let mut right_x = Pixels::ZERO;
 
         for run in &self.runs {
-            let split_pos = run.glyphs.partition_point(|g| g.index < byte_index);
-
-            if split_pos > 0 {
+            let mut left_glyphs = Vec::new();
+            let mut right_glyphs = Vec::new();
+            let mut prev_left_ix = None;
+            let mut prev_right_ix = None;
+            for glyph in &run.glyphs {
+                let advance = cluster_width(glyph.index, run.bidi_level);
+                if glyph.index < byte_index {
+                    let x = if prev_left_ix == Some(glyph.index) {
+                        left_glyphs
+                            .last()
+                            .map_or(left_x, |g: &ShapedGlyph| g.position.x)
+                    } else {
+                        let start = left_x;
+                        left_x += advance;
+                        prev_left_ix = Some(glyph.index);
+                        start
+                    };
+                    left_glyphs.push(ShapedGlyph {
+                        id: glyph.id,
+                        position: point(x, glyph.position.y),
+                        index: glyph.index,
+                        is_emoji: glyph.is_emoji,
+                    });
+                } else {
+                    let x = if prev_right_ix == Some(glyph.index) {
+                        right_glyphs
+                            .last()
+                            .map_or(right_x, |g: &ShapedGlyph| g.position.x)
+                    } else {
+                        let start = right_x;
+                        right_x += advance;
+                        prev_right_ix = Some(glyph.index);
+                        start
+                    };
+                    right_glyphs.push(ShapedGlyph {
+                        id: glyph.id,
+                        position: point(x, glyph.position.y),
+                        index: glyph.index - byte_index,
+                        is_emoji: glyph.is_emoji,
+                    });
+                }
+            }
+            if !left_glyphs.is_empty() {
                 left_runs.push(ShapedRun {
                     font_id: run.font_id,
-                    glyphs: run.glyphs[..split_pos].to_vec(),
+                    glyphs: left_glyphs,
+                    bidi_level: run.bidi_level,
                 });
             }
-
-            if split_pos < run.glyphs.len() {
-                let right_glyphs = run.glyphs[split_pos..]
-                    .iter()
-                    .map(|g| ShapedGlyph {
-                        id: g.id,
-                        position: point(g.position.x - x_offset, g.position.y),
-                        index: g.index - byte_index,
-                        is_emoji: g.is_emoji,
-                    })
-                    .collect();
+            if !right_glyphs.is_empty() {
                 right_runs.push(ShapedRun {
                     font_id: run.font_id,
                     glyphs: right_glyphs,
+                    bidi_level: run.bidi_level,
                 });
             }
         }
 
-        let left = LineLayout {
-            font_size: self.font_size,
-            width: x_offset,
-            ascent: self.ascent,
-            descent: self.descent,
-            runs: left_runs,
-            len: byte_index,
-        };
-
-        let right = LineLayout {
-            font_size: self.font_size,
-            width: self.width - x_offset,
-            ascent: self.ascent,
-            descent: self.descent,
-            runs: right_runs,
-            len: self.len - byte_index,
-        };
-
-        (left, right)
+        (
+            LineLayout {
+                font_size: self.font_size,
+                width: left_x,
+                ascent: self.ascent,
+                descent: self.descent,
+                runs: left_runs,
+                len: byte_index,
+                base_direction: self.base_direction,
+            },
+            LineLayout {
+                font_size: self.font_size,
+                width: right_x,
+                ascent: self.ascent,
+                descent: self.descent,
+                runs: right_runs,
+                len: self.len - byte_index,
+                base_direction: self.base_direction,
+            },
+        )
     }
 
     pub(crate) fn compute_wrap_boundaries(
@@ -435,49 +937,70 @@ impl WrappedLineLayout {
             Err(wrapped_line_start_index)
         } else if position_in_unwrapped_line.x >= wrapped_line_end_x {
             Err(wrapped_line_end_index)
+        } else if closest {
+            Ok(self
+                .unwrapped_layout
+                .closest_index_for_x(position_in_unwrapped_line.x))
         } else {
-            if closest {
-                Ok(self
-                    .unwrapped_layout
-                    .closest_index_for_x(position_in_unwrapped_line.x))
-            } else {
-                // The shaper can place a trailing zero-width wrap boundary glyph slightly past
-                // the line's width, so the row can extend past where `index_for_x` has glyphs.
-                self.unwrapped_layout
-                    .index_for_x(position_in_unwrapped_line.x)
-                    .ok_or(wrapped_line_end_index)
-            }
+            // The shaper can place a trailing zero-width wrap boundary glyph slightly past
+            // the line's width, so the row can extend past where `legacy_index_for_x` has glyphs.
+            self.unwrapped_layout
+                .legacy_index_for_x(position_in_unwrapped_line.x)
+                .ok_or(wrapped_line_end_index)
         }
     }
 
-    /// Returns the pixel position for the given byte index.
+    /// Returns the pixel position for the given byte index (bidi-safe across soft wraps).
     pub fn position_for_index(&self, index: usize, line_height: Pixels) -> Option<Point<Pixels>> {
-        let mut line_start_ix = 0;
-        let line_end_indices = self
-            .wrap_boundaries
-            .iter()
-            .map(|wrap_boundary| {
-                let run = &self.unwrapped_layout.runs[wrap_boundary.run_ix];
-                let glyph = &run.glyphs[wrap_boundary.glyph_ix];
-                glyph.index
-            })
-            .chain([self.len()])
-            .enumerate();
-        for (ix, line_end_ix) in line_end_indices {
-            let line_y = ix as f32 * line_height;
-            if index < line_start_ix {
-                break;
-            } else if index > line_end_ix {
-                line_start_ix = line_end_ix;
-                continue;
+        self.position_for_index_with_affinity(index, CaretAffinity::Downstream, line_height)
+    }
+
+    /// Returns the pixel position for `index` and `affinity` across soft-wrapped rows.
+    pub fn position_for_index_with_affinity(
+        &self,
+        index: usize,
+        affinity: CaretAffinity,
+        line_height: Pixels,
+    ) -> Option<Point<Pixels>> {
+        if index > self.len() {
+            return None;
+        }
+        let caret_x = self.unwrapped_layout.caret_x_for_index(index, affinity);
+        let row_count = self.wrap_boundaries.len() + 1;
+        for row_ix in 0..row_count {
+            let row_start_x = if row_ix == 0 {
+                Pixels::ZERO
             } else {
-                let line_start_x = self.unwrapped_layout.x_for_index(line_start_ix);
-                let x = self.unwrapped_layout.x_for_index(index) - line_start_x;
-                return Some(point(x, line_y));
+                let boundary = self.wrap_boundaries[row_ix - 1];
+                self.unwrapped_layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix]
+                    .position
+                    .x
+            };
+            let row_end_x = if row_ix < self.wrap_boundaries.len() {
+                let boundary = self.wrap_boundaries[row_ix];
+                self.unwrapped_layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix]
+                    .position
+                    .x
+            } else {
+                self.unwrapped_layout.width
+            };
+            let is_last_row = row_ix + 1 == row_count;
+            let in_row = if is_last_row {
+                caret_x >= row_start_x && caret_x <= row_end_x
+            } else if affinity == CaretAffinity::Upstream {
+                caret_x > row_start_x && caret_x <= row_end_x
+            } else {
+                caret_x >= row_start_x && caret_x < row_end_x
+            };
+            if in_row {
+                let line_y = row_ix as f32 * line_height;
+                return Some(point((caret_x - row_start_x).max(Pixels::ZERO), line_y));
             }
         }
-
-        None
+        Some(point(
+            Pixels::ZERO,
+            (row_count.saturating_sub(1)) as f32 * line_height,
+        ))
     }
 }
 
@@ -610,6 +1133,29 @@ impl LineLayoutCache {
         Text: AsRef<str>,
         SharedString: From<Text>,
     {
+        self.layout_wrapped_line_with_direction(
+            text,
+            font_size,
+            runs,
+            wrap_width,
+            max_lines,
+            BaseDirection::Ltr,
+        )
+    }
+
+    pub fn layout_wrapped_line_with_direction<Text>(
+        &self,
+        text: Text,
+        font_size: Pixels,
+        runs: &[FontRun],
+        wrap_width: Option<Pixels>,
+        max_lines: Option<usize>,
+        base_direction: BaseDirection,
+    ) -> Arc<WrappedLineLayout>
+    where
+        Text: AsRef<str>,
+        SharedString: From<Text>,
+    {
         let _font_generation = self.clear_if_font_generation_changed();
         let key = &CacheKeyRef {
             text: text.as_ref(),
@@ -617,6 +1163,7 @@ impl LineLayoutCache {
             runs,
             wrap_width,
             force_width: None,
+            base_direction,
         } as &dyn AsCacheKeyRef;
 
         let state = self.state.borrow();
@@ -637,7 +1184,13 @@ impl LineLayoutCache {
         } else {
             drop(state);
             let text = SharedString::from(text);
-            let unwrapped_layout = self.layout_line::<&SharedString>(&text, font_size, runs, None);
+            let unwrapped_layout = self.layout_line_with_direction::<&SharedString>(
+                &text,
+                font_size,
+                runs,
+                None,
+                base_direction,
+            );
             let wrap_boundaries = if let Some(wrap_width) = wrap_width {
                 unwrapped_layout.compute_wrap_boundaries(
                     text.as_ref(),
@@ -659,6 +1212,7 @@ impl LineLayoutCache {
                 runs: SmallVec::from(runs),
                 wrap_width,
                 force_width: None,
+                base_direction,
             });
 
             let mut state = self.state.borrow_mut();
@@ -683,6 +1237,21 @@ impl LineLayoutCache {
         Text: AsRef<str>,
         SharedString: From<Text>,
     {
+        self.layout_line_with_direction(text, font_size, runs, force_width, BaseDirection::Ltr)
+    }
+
+    pub fn layout_line_with_direction<Text>(
+        &self,
+        text: Text,
+        font_size: Pixels,
+        runs: &[FontRun],
+        force_width: Option<Pixels>,
+        base_direction: BaseDirection,
+    ) -> Arc<LineLayout>
+    where
+        Text: AsRef<str>,
+        SharedString: From<Text>,
+    {
         let _font_generation = self.clear_if_font_generation_changed();
         let key = &CacheKeyRef {
             text: text.as_ref(),
@@ -690,6 +1259,7 @@ impl LineLayoutCache {
             runs,
             wrap_width: None,
             force_width,
+            base_direction,
         } as &dyn AsCacheKeyRef;
 
         let state = self.state.borrow();
@@ -709,7 +1279,8 @@ impl LineLayoutCache {
             layout
         } else {
             let text = SharedString::from(text);
-            let mut layout = crate::fast::text::shape_line(self, &text, font_size, runs);
+            let mut layout =
+                crate::fast::text::shape_line(self, &text, font_size, runs, base_direction);
 
             if let Some(force_width) = force_width {
                 apply_force_width_to_layout(&mut layout, force_width);
@@ -721,6 +1292,7 @@ impl LineLayoutCache {
                 runs: SmallVec::from(runs),
                 wrap_width: None,
                 force_width,
+                base_direction,
             });
             let layout = Arc::new(layout);
             current_frame.lines.insert(key.clone(), layout.clone());
@@ -796,6 +1368,7 @@ pub(crate) struct CacheKey {
     runs: SmallVec<[FontRun; 1]>,
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
+    base_direction: BaseDirection,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
@@ -805,6 +1378,7 @@ struct CacheKeyRef<'a> {
     runs: &'a [FontRun],
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
+    base_direction: BaseDirection,
 }
 
 impl PartialEq for dyn AsCacheKeyRef + '_ {
@@ -829,6 +1403,7 @@ impl AsCacheKeyRef for CacheKey {
             runs: self.runs.as_slice(),
             wrap_width: self.wrap_width,
             force_width: self.force_width,
+            base_direction: self.base_direction,
         }
     }
 }
@@ -854,5 +1429,245 @@ impl<'a> Borrow<dyn AsCacheKeyRef + 'a> for Arc<CacheKey> {
 impl AsCacheKeyRef for CacheKeyRef<'_> {
     fn as_cache_key_ref(&self) -> CacheKeyRef<'_> {
         *self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use unicode_segmentation::UnicodeSegmentation;
+
+    /// Builds a synthetic `LineLayout` with whole-paragraph UAX #9 reordering and
+    /// fixed per-grapheme width so bidi geometry tests are deterministic across platforms.
+    fn build_bidi_layout(text: &str, base: BaseDirection, glyph_w: f32) -> LineLayout {
+        let visual_runs = reorder_line_visual_runs(text, base, 0..text.len());
+        let mut runs = Vec::new();
+        let mut x = 0.0_f32;
+        for vrun in visual_runs {
+            let slice = &text[vrun.byte_range.clone()];
+            let mut graphemes: Vec<usize> = slice
+                .grapheme_indices(true)
+                .map(|(rel, _)| vrun.byte_range.start + rel)
+                .collect();
+            if vrun.bidi_level % 2 == 1 {
+                graphemes.reverse();
+            }
+            let mut glyphs = Vec::with_capacity(graphemes.len());
+            for byte_ix in graphemes {
+                glyphs.push(ShapedGlyph {
+                    id: GlyphId(1),
+                    position: point(px(x), px(0.0)),
+                    index: byte_ix,
+                    is_emoji: false,
+                });
+                x += glyph_w;
+            }
+            runs.push(ShapedRun {
+                font_id: FontId(0),
+                glyphs,
+                bidi_level: vrun.bidi_level,
+            });
+        }
+        LineLayout {
+            font_size: px(16.0),
+            width: px(x),
+            ascent: px(12.0),
+            descent: px(4.0),
+            runs,
+            len: text.len(),
+            base_direction: base,
+        }
+    }
+
+    #[test]
+    fn bidi_line_layout_caret_hit_test_and_selection_rects() {
+        let glyph_w = 10.0_f32;
+        let cases: &[(&str, BaseDirection, bool)] = &[
+            ("Hello world", BaseDirection::Ltr, false),
+            ("مرحبا بالعالم", BaseDirection::Rtl, true),
+            ("שלום עולם", BaseDirection::AutoFirstStrong, true),
+            ("Hello سلام 123 world", BaseDirection::Ltr, false),
+            ("A 👨‍👩‍👧‍👦 B", BaseDirection::Ltr, false),
+        ];
+
+        for &(text, base, expect_rtl_base) in cases {
+            let (resolved_dir, levels) = resolve_paragraph_bidi_levels(text, base);
+            assert_eq!(resolved_dir.is_rtl(), expect_rtl_base, "case={text:?}");
+            assert_eq!(levels.len(), text.len(), "case={text:?}");
+
+            let layout = build_bidi_layout(text, base, glyph_w);
+            let grapheme_starts: Vec<usize> =
+                text.grapheme_indices(true).map(|(ix, _)| ix).collect();
+
+            // Round-trip caret_x_for_index <-> index_for_x on every grapheme cluster.
+            for (g_ix, &byte_start) in grapheme_starts.iter().enumerate() {
+                let byte_end = grapheme_starts.get(g_ix + 1).copied().unwrap_or(text.len());
+                let lead_x = layout.caret_x_for_index(byte_start, CaretAffinity::Downstream);
+                let trail_x = layout.caret_x_for_index(byte_end, CaretAffinity::Upstream);
+                let is_rtl_cluster = (levels[byte_start] % 2) == 1;
+                if is_rtl_cluster {
+                    assert!(
+                        lead_x > trail_x,
+                        "RTL cluster must place leading edge to the right of trailing edge: {text:?} @ {byte_start}"
+                    );
+                } else {
+                    assert!(
+                        trail_x > lead_x,
+                        "LTR cluster must place trailing edge to the right of leading edge: {text:?} @ {byte_start}"
+                    );
+                }
+                let probe_lead = if is_rtl_cluster {
+                    lead_x - px(1.0)
+                } else {
+                    lead_x + px(1.0)
+                };
+                assert_eq!(
+                    layout.index_for_x(probe_lead),
+                    (byte_start, CaretAffinity::Downstream),
+                    "lead hit-test mismatch for {text:?} @ {byte_start}"
+                );
+                let probe_trail = if is_rtl_cluster {
+                    trail_x + px(1.0)
+                } else {
+                    trail_x - px(1.0)
+                };
+                assert_eq!(
+                    layout.index_for_x(probe_trail),
+                    (byte_end, CaretAffinity::Upstream),
+                    "trail hit-test mismatch for {text:?} @ {byte_end}"
+                );
+            }
+        }
+
+        // Cross-direction selection in "Hello سلام 123 world" produces disjoint visual rects.
+        let mixed = "Hello سلام 123 world";
+        let mixed_layout = build_bidi_layout(mixed, BaseDirection::Ltr, glyph_w);
+        // Select "lo " (3..6) + first two Arabic letters "سل" (6..10):
+        // Visual order is "Hello " | "123" | " " | "مالس" | " world", so "lo " and "سل" are disjoint.
+        let rects = mixed_layout.selection_rects_for_range(3..10);
+        assert_eq!(
+            rects.len(),
+            2,
+            "mixed LTR/RTL selection should return 2 disjoint rectangles, got {rects:?}"
+        );
+        assert!((f32::from(rects[0].size.width) - 30.0).abs() < 1e-3);
+        assert!((f32::from(rects[1].size.width) - 20.0).abs() < 1e-3);
+
+        // Same-direction contiguous selection merges into a single rectangle.
+        let ltr_rects = mixed_layout.selection_rects_for_range(0..5);
+        assert_eq!(ltr_rects.len(), 1);
+        assert!((f32::from(ltr_rects[0].size.width) - 50.0).abs() < 1e-3);
+
+        // Emoji ZWJ interior byte offset snaps to the grapheme cluster boundary.
+        let emoji = "A 👨‍👩‍👧‍👦 B";
+        let emoji_layout = build_bidi_layout(emoji, BaseDirection::Ltr, glyph_w);
+        let emoji_start = emoji.find('👨').unwrap();
+        let x_start = emoji_layout.caret_x_for_index(emoji_start, CaretAffinity::Downstream);
+        let x_interior = emoji_layout.caret_x_for_index(emoji_start + 4, CaretAffinity::Downstream);
+        assert_eq!(x_start, x_interior);
+
+        // Soft-wrap boundary round-trip on WrappedLineLayout.
+        let wrapped = WrappedLineLayout {
+            unwrapped_layout: Arc::new(mixed_layout),
+            wrap_boundaries: smallvec::smallvec![WrapBoundary {
+                run_ix: 1,
+                glyph_ix: 0,
+            }],
+            wrap_width: Some(px(100.0)),
+        };
+        let pos_row0 = wrapped
+            .position_for_index_with_affinity(0, CaretAffinity::Downstream, px(20.0))
+            .expect("row 0 pos");
+        assert_eq!(pos_row0.y, px(0.0));
+        let pos_row1 = wrapped
+            .position_for_index_with_affinity(mixed.len(), CaretAffinity::Upstream, px(20.0))
+            .expect("row 1 pos");
+        assert_eq!(pos_row1.y, px(20.0));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn platform_shaper_respects_explicit_base_direction_and_arabic_joining() {
+        #[cfg(target_os = "macos")]
+        let platform_ts: Arc<dyn PlatformTextSystem> = Arc::new(crate::AppleTextSystem::new());
+        #[cfg(target_os = "linux")]
+        let platform_ts: Arc<dyn PlatformTextSystem> =
+            Arc::new(crate::CosmicTextSystem::new("sans-serif"));
+
+        let text_system = Arc::new(crate::TextSystem::new(platform_ts.clone()));
+        let font_id = text_system.resolve_font(&crate::font("sans-serif"));
+        let cache = LineLayoutCache::new(platform_ts, Arc::new(AtomicUsize::new(0)));
+
+        // 1. Explicit BaseDirection::Rtl on a Latin-leading string ("Brand مرحبا") must
+        // resolve differently from BaseDirection::Ltr and must not collide in LineLayoutCache.
+        let mixed = "Brand مرحبا";
+        let runs = [FontRun {
+            len: mixed.len(),
+            font_id,
+        }];
+        let ltr =
+            cache.layout_line_with_direction(mixed, px(16.0), &runs, None, BaseDirection::Ltr);
+        let rtl =
+            cache.layout_line_with_direction(mixed, px(16.0), &runs, None, BaseDirection::Rtl);
+        assert_eq!(ltr.base_direction, BaseDirection::Ltr);
+        assert_eq!(rtl.base_direction, BaseDirection::Rtl);
+        assert_ne!(
+            Arc::as_ptr(&ltr),
+            Arc::as_ptr(&rtl),
+            "LineLayoutCache must key by BaseDirection"
+        );
+        let ltr_start_x = ltr.caret_x_for_index(0, CaretAffinity::Downstream);
+        let rtl_start_x = rtl.caret_x_for_index(0, CaretAffinity::Downstream);
+        assert!(
+            rtl_start_x > ltr_start_x,
+            "in explicit RTL base direction, leading Latin word should sit to the right of Arabic ({rtl_start_x:?} vs {ltr_start_x:?})"
+        );
+
+        // 2. Splitting an Arabic word ("سلام") across two same-font runs (color/highlight split)
+        // must preserve contextual joining glyphs.
+        let arabic = "سلام";
+        let split_at = "سل".len();
+        let single_run = [FontRun {
+            len: arabic.len(),
+            font_id,
+        }];
+        let dual_runs = [
+            FontRun {
+                len: split_at,
+                font_id,
+            },
+            FontRun {
+                len: arabic.len() - split_at,
+                font_id,
+            },
+        ];
+        let single_layout = cache.layout_line_with_direction(
+            arabic,
+            px(16.0),
+            &single_run,
+            None,
+            BaseDirection::Rtl,
+        );
+        let dual_layout = cache.layout_line_with_direction(
+            arabic,
+            px(16.0),
+            &dual_runs,
+            None,
+            BaseDirection::Rtl,
+        );
+        let single_glyphs: Vec<GlyphId> = single_layout
+            .runs
+            .iter()
+            .flat_map(|r| r.glyphs.iter().map(|g| g.id))
+            .collect();
+        let dual_glyphs: Vec<GlyphId> = dual_layout
+            .runs
+            .iter()
+            .flat_map(|r| r.glyphs.iter().map(|g| g.id))
+            .collect();
+        assert_eq!(
+            single_glyphs, dual_glyphs,
+            "same-font style split across Arabic word must preserve contextual joining"
+        );
     }
 }

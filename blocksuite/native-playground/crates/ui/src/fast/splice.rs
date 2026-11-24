@@ -957,6 +957,7 @@ impl Window {
                 parent_node: dispatch.refresh(deferred_draw.parent_node),
                 element_id_stack: deferred_draw.element_id_stack.clone(),
                 text_style_stack: deferred_draw.text_style_stack.clone(),
+                layout_direction_stack: deferred_draw.layout_direction_stack.clone(),
                 content_mask: deferred_draw.content_mask,
                 rem_size: deferred_draw.rem_size,
                 priority: deferred_draw.priority,

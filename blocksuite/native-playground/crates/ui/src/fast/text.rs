@@ -777,15 +777,26 @@ impl LineShaping {
         text: &str,
         font_size: Pixels,
         runs: &[FontRun],
+        base_direction: crate::BaseDirection,
     ) -> LineLayout {
-        let hash = RecentShapes::hash(text, font_size, runs);
-        if let Some(layout) = self.recent.lock().get(hash, text, font_size, runs) {
+        let hash = RecentShapes::hash(text, font_size, runs, base_direction);
+        if let Some(layout) = self
+            .recent
+            .lock()
+            .get(hash, text, font_size, runs, base_direction)
+        {
             return layout;
         }
-        let layout = self.shape_line_uncached(platform_text_system, text, font_size, runs);
-        self.recent
-            .lock()
-            .insert(hash, text, font_size, runs, copy_layout(&layout));
+        let layout =
+            self.shape_line_uncached(platform_text_system, text, font_size, runs, base_direction);
+        self.recent.lock().insert(
+            hash,
+            text,
+            font_size,
+            runs,
+            base_direction,
+            copy_layout(&layout),
+        );
         layout
     }
 
@@ -795,13 +806,28 @@ impl LineShaping {
         text: &str,
         font_size: Pixels,
         runs: &[FontRun],
+        base_direction: crate::BaseDirection,
     ) -> LineLayout {
         let started_at = self.shape_timed.load(Ordering::Relaxed).then(Instant::now);
-        let layout = self
-            .numbers
-            .lock()
-            .shape(platform_text_system, text, font_size, runs)
-            .unwrap_or_else(|| platform_text_system.layout_line(text, font_size, runs));
+        let layout = if base_direction == crate::BaseDirection::Ltr {
+            self.numbers
+                .lock()
+                .shape(platform_text_system, text, font_size, runs)
+        } else {
+            None
+        }
+        .unwrap_or_else(|| {
+            if base_direction == crate::BaseDirection::Ltr {
+                platform_text_system.layout_line(text, font_size, runs)
+            } else {
+                platform_text_system.layout_line_with_direction(
+                    text,
+                    font_size,
+                    runs,
+                    base_direction,
+                )
+            }
+        });
         self.lines_shaped.fetch_add(1, Ordering::Relaxed);
         if let Some(started_at) = started_at {
             self.shape_nanos
@@ -839,6 +865,7 @@ struct RecentShape {
     text: Box<str>,
     font_size: Pixels,
     runs: SmallVec<[FontRun; 1]>,
+    base_direction: crate::BaseDirection,
     layout: LineLayout,
 }
 
@@ -856,11 +883,17 @@ pub(crate) struct RecentShapes {
 }
 
 impl RecentShapes {
-    pub(crate) fn hash(text: &str, font_size: Pixels, runs: &[FontRun]) -> u64 {
+    pub(crate) fn hash(
+        text: &str,
+        font_size: Pixels,
+        runs: &[FontRun],
+        base_direction: crate::BaseDirection,
+    ) -> u64 {
         let mut hasher = FxHasher::default();
         text.hash(&mut hasher);
         font_size.0.to_bits().hash(&mut hasher);
         runs.hash(&mut hasher);
+        base_direction.hash(&mut hasher);
         hasher.finish()
     }
 
@@ -870,6 +903,7 @@ impl RecentShapes {
         text: &str,
         font_size: Pixels,
         runs: &[FontRun],
+        base_direction: crate::BaseDirection,
     ) -> Option<LineLayout> {
         let fonts_generation = FONTS_GENERATION.load(Ordering::Relaxed);
         if fonts_generation != self.fonts_generation {
@@ -883,6 +917,7 @@ impl RecentShapes {
             &*shape.text == text
                 && shape.font_size.0.to_bits() == font_size.0.to_bits()
                 && shape.runs.as_slice() == runs
+                && shape.base_direction == base_direction
         };
         if let Some(shape) = self
             .current
@@ -908,6 +943,7 @@ impl RecentShapes {
         text: &str,
         font_size: Pixels,
         runs: &[FontRun],
+        base_direction: crate::BaseDirection,
         layout: LineLayout,
     ) {
         if self.fonts_generation != FONTS_GENERATION.load(Ordering::Relaxed) {
@@ -919,6 +955,7 @@ impl RecentShapes {
                 text: text.into(),
                 font_size,
                 runs: SmallVec::from(runs),
+                base_direction,
                 layout,
             },
         );
@@ -951,6 +988,7 @@ fn copy_layout(layout: &LineLayout) -> LineLayout {
         descent,
         runs,
         len,
+        base_direction,
     } = layout;
     LineLayout {
         font_size: *font_size,
@@ -959,6 +997,7 @@ fn copy_layout(layout: &LineLayout) -> LineLayout {
         descent: *descent,
         runs: runs.clone(),
         len: *len,
+        base_direction: *base_direction,
     }
 }
 
@@ -969,10 +1008,15 @@ pub(crate) fn shape_line(
     text: &str,
     font_size: Pixels,
     runs: &[FontRun],
+    base_direction: crate::BaseDirection,
 ) -> LineLayout {
-    cache
-        .shaping
-        .shape_line(&*cache.platform_text_system, text, font_size, runs)
+    cache.shaping.shape_line(
+        &*cache.platform_text_system,
+        text,
+        font_size,
+        runs,
+        base_direction,
+    )
 }
 
 /// The decoration runs of a line about to be measured. Most lines carry one

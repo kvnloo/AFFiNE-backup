@@ -962,6 +962,7 @@ pub(crate) struct DeferredDraw {
     pub(crate) parent_node: DispatchNodeId,
     pub(crate) element_id_stack: ElementIdStack,
     pub(crate) text_style_stack: crate::fast::text_style::TextStyleStack,
+    pub(crate) layout_direction_stack: SmallVec<[crate::Direction; 8]>,
     pub(crate) content_mask: Option<ContentMask<Pixels>>,
     pub(crate) rem_size: Pixels,
     pub(crate) element: Option<AnyElement>,
@@ -1171,6 +1172,7 @@ pub struct Window {
     pub(crate) global_ids: crate::fast::global_id::GlobalIdCache,
     pub(crate) retained_state: crate::fast::retained::RetainedState,
     pub(crate) text_style_stack: crate::fast::text_style::TextStyleStack,
+    pub(crate) layout_direction_stack: SmallVec<[crate::Direction; 8]>,
     pub(crate) fast_glyph_bounds: crate::fast::glyphs::GlyphBoundsCache,
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
@@ -1198,6 +1200,9 @@ pub struct Window {
     pub(crate) default_prevented: bool,
     pub(crate) mouse_position: Point<Pixels>,
     pub(crate) mouse_hit_test: HitTest,
+    pub(crate) touch_gestures: crate::TouchGestureRecognizer,
+    pub(crate) touch_gesture_epoch: Option<crate::scheduler::Instant>,
+    pub(crate) last_touch_gestures: SmallVec<[crate::TouchGesture; 2]>,
     pub(crate) fast_pointer_outside: bool,
     modifiers: Modifiers,
     capslock: Capslock,
@@ -2135,6 +2140,7 @@ impl Window {
             global_ids: crate::fast::global_id::GlobalIdCache::default(),
             retained_state: crate::fast::retained::RetainedState::new(cx),
             text_style_stack: crate::fast::text_style::TextStyleStack::default(),
+            layout_direction_stack: SmallVec::new(),
             fast_glyph_bounds: crate::fast::glyphs::GlyphBoundsCache::default(),
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
@@ -2158,6 +2164,9 @@ impl Window {
             default_prevented: true,
             mouse_position,
             mouse_hit_test: HitTest::default(),
+            touch_gestures: crate::TouchGestureRecognizer::default(),
+            touch_gesture_epoch: None,
+            last_touch_gestures: SmallVec::new(),
             fast_pointer_outside: false,
             modifiers,
             capslock,
@@ -3620,6 +3629,8 @@ impl Window {
                         .clone_from(&deferred_draw.element_id_stack);
                     self.text_style_stack
                         .clone_from(&deferred_draw.text_style_stack);
+                    self.layout_direction_stack
+                        .clone_from(&deferred_draw.layout_direction_stack);
                     (
                         deferred_draw.element.take(),
                         deferred_draw.parent_node,
@@ -3664,6 +3675,7 @@ impl Window {
 
             self.element_id_stack.clear();
             self.text_style_stack.clear();
+            self.layout_direction_stack.clear();
             round_start = round_end;
         }
     }
@@ -3771,6 +3783,7 @@ impl Window {
                     parent_node: reused_subtree.refresh_node_id(deferred_draw.parent_node),
                     element_id_stack: deferred_draw.element_id_stack.clone(),
                     text_style_stack: deferred_draw.text_style_stack.clone(),
+                    layout_direction_stack: deferred_draw.layout_direction_stack.clone(),
                     content_mask: deferred_draw.content_mask,
                     rem_size: deferred_draw.rem_size,
                     priority: deferred_draw.priority,
@@ -3844,6 +3857,27 @@ impl Window {
             range.start.scene_index..range.end.scene_index,
             &self.rendered_frame.scene,
         );
+    }
+
+    /// Returns the resolved inline layout direction in effect for the current element.
+    #[inline]
+    pub fn layout_direction(&self) -> crate::Direction {
+        self.layout_direction_stack
+            .last()
+            .copied()
+            .unwrap_or(crate::Direction::Ltr)
+    }
+
+    /// Push a layout direction onto the stack and run `f` with the resolved direction active.
+    pub fn with_layout_direction<F, R>(&mut self, direction: crate::LayoutDirection, f: F) -> R
+    where
+        F: FnOnce(&mut Self) -> R,
+    {
+        let resolved = direction.resolve(self.layout_direction());
+        self.layout_direction_stack.push(resolved);
+        let result = f(self);
+        self.layout_direction_stack.pop();
+        result
     }
 
     /// Push a text style onto the stack, and call a function with that style active.
@@ -4286,6 +4320,7 @@ impl Window {
             parent_node,
             element_id_stack: self.element_id_stack.clone(),
             text_style_stack: self.text_style_stack.clone(),
+            layout_direction_stack: self.layout_direction_stack.clone(),
             content_mask,
             rem_size: self.rem_size(),
             priority,
@@ -5025,12 +5060,13 @@ impl Window {
     #[must_use]
     pub fn request_layout(
         &mut self,
-        style: Style,
+        mut style: Style,
         children: impl IntoIterator<Item = LayoutId>,
         cx: &mut App,
     ) -> LayoutId {
         self.invalidator.debug_assert_prepaint();
 
+        style.direction = style.direction.resolve(self.layout_direction()).into();
         cx.layout_id_buffer.clear();
         cx.layout_id_buffer.extend(children);
         let rem_size = self.rem_size();
@@ -5054,13 +5090,14 @@ impl Window {
     /// returns a `Size`.
     ///
     /// This method should only be called as part of the request_layout or prepaint phase of element drawing.
-    pub fn request_measured_layout<F>(&mut self, style: Style, measure: F) -> LayoutId
+    pub fn request_measured_layout<F>(&mut self, mut style: Style, measure: F) -> LayoutId
     where
         F: Fn(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
             + 'static,
     {
         self.invalidator.debug_assert_prepaint();
 
+        style.direction = style.direction.resolve(self.layout_direction()).into();
         let rem_size = self.rem_size();
         let scale_factor = self.scale_factor();
         let fast_key = crate::fast::layout_key::layout_key(self);
@@ -5600,7 +5637,33 @@ impl Window {
     /// Runs the portable gesture recognizer over a raw touch event and
     /// dispatches whatever it resolves (scroll steps, synthesized taps)
     /// through the ordinary mouse-event path.
-    fn dispatch_touch_event(&mut self, _event: &TouchEvent, _cx: &mut App) {}
+    fn dispatch_touch_event(&mut self, event: &TouchEvent, cx: &mut App) {
+        let now = cx.background_executor().now();
+        let epoch = *self.touch_gesture_epoch.get_or_insert(now);
+        let now_ms = now.saturating_duration_since(epoch).as_millis() as u64;
+        let direction = self.layout_direction();
+        let viewport_width = self.viewport_size.width;
+        let gestures = self
+            .touch_gestures
+            .feed(event, now_ms, direction, viewport_width);
+        if !gestures.is_empty() {
+            self.last_touch_gestures = gestures;
+            self.refresh();
+        }
+    }
+
+    /// Returns and clears touch gestures recognized during recent touch dispatch.
+    pub fn take_touch_gestures(&mut self) -> SmallVec<[crate::TouchGesture; 2]> {
+        std::mem::take(&mut self.last_touch_gestures)
+    }
+
+    /// Evaluates time-based touch gestures (such as `LongPress`) against the scheduler clock.
+    pub fn tick_touch_gestures(&mut self, cx: &App) -> SmallVec<[crate::TouchGesture; 2]> {
+        let now = cx.background_executor().now();
+        let epoch = *self.touch_gesture_epoch.get_or_insert(now);
+        let now_ms = now.saturating_duration_since(epoch).as_millis() as u64;
+        self.touch_gestures.tick(now_ms)
+    }
 
     fn dispatch_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {
         crate::fast::dependencies::read_pointer(self);

@@ -89,6 +89,11 @@ impl ShapedLine {
         self.layout.width
     }
 
+    /// Compatibility index lookup returning the cluster start byte index at `x`, or `None` past `width`.
+    pub fn index_for_x(&self, x: Pixels) -> Option<usize> {
+        self.layout.legacy_index_for_x(x)
+    }
+
     /// Override the len, useful if you're rendering text a
     /// as text b (e.g. rendering invisibles).
     pub fn with_len(mut self, len: usize) -> Self {
@@ -100,6 +105,7 @@ impl ShapedLine {
             descent: layout.descent,
             runs: layout.runs.clone(),
             len,
+            base_direction: layout.base_direction,
         });
         self
     }
