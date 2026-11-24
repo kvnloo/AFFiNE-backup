@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = ["."]
+
+[package]
+name = "affine-store"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[lints.rust]
+unexpected_cfgs = "deny"
+
+[dependencies]
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+y-octo = { version = "0.4.0", default-features = false, features = ["session", "large_refs"] }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+sqlx = { version = "0.8.6", default-features = false, features = ["sqlite", "migrate", "runtime-tokio", "chrono"] }
+
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
