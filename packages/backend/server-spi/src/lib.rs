@@ -6,6 +6,7 @@
 pub mod billing;
 pub mod copilot;
 pub mod disposition;
+pub mod embedding;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -21,6 +22,10 @@ pub use billing::{
 use chrono::{DateTime, Utc};
 pub use copilot::{CommunityCopilotPolicySpi, CommunityCopilotRuntime, CopilotPolicySpi, CopilotRuntimeSpi};
 pub use disposition::DomainDispositionHandler;
+pub use embedding::{
+  AddWorkspaceArtifactInput, CommunityCopilotEmbeddingSpi, CopilotEmbeddingSpi, EmbeddingPagination,
+  WorkspaceArtifactPage, WorkspaceArtifactRecord, WorkspaceIgnoredDocPage, WorkspaceIgnoredDocRecord,
+};
 pub use server_types::BillingSubject;
 use server_types::{AccessGrant, DomainError};
 use sha2::{Digest, Sha256};
@@ -165,6 +170,9 @@ pub trait ServerExtension: Send + Sync + 'static {
   fn copilot_policy(&self) -> Arc<dyn CopilotPolicySpi>;
   fn copilot_runtime(&self) -> Arc<dyn CopilotRuntimeSpi> {
     Arc::new(CommunityCopilotRuntime)
+  }
+  fn copilot_embedding_spi(&self) -> Arc<dyn CopilotEmbeddingSpi> {
+    Arc::new(CommunityCopilotEmbeddingSpi)
   }
   fn rate_limit_policy(&self) -> Arc<dyn RateLimitPolicy> {
     Arc::new(CommunityRateLimitPolicy)

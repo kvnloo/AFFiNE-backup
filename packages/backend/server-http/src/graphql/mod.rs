@@ -8,6 +8,7 @@ pub mod calendar;
 pub mod comment;
 pub mod copilot;
 pub mod doc;
+pub mod embedding;
 pub mod license;
 pub mod mcp;
 pub mod notification;
@@ -532,6 +533,7 @@ pub struct MutationRoot(
   mcp::McpMutation,
   billing::BillingMutation,
   copilot::CopilotMutation,
+  embedding::EmbeddingMutation,
 );
 
 pub fn build_schema(state: Arc<AppState>) -> AppSchema {
