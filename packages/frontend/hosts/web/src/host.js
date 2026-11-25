@@ -11,6 +11,11 @@ import {
   setLocalWorkspaceIds,
   setWebPreference,
 } from './idb-storage.js';
+import { createPdfPreviewClient } from './pdf-client.js';
+import {
+  attachImeSelectionGuard,
+  executeClipboardAction,
+} from './selection-overlay.js';
 import { createWorkerLoader, readEmbeddedManifest } from './worker-loader.js';
 
 /**
@@ -387,6 +392,287 @@ export function removeBootSkeleton(doc) {
 }
 
 /**
+ * Creates a deterministic graphics context recovery and legacy-fallback
+ * controller for `#app-canvas` WebGL2 and WebGPU devices.
+ *
+ * @param {Object} options
+ * @param {() => string} options.getHref
+ * @param {() => boolean} options.isOAuthCodeConsumed
+ * @param {() => HTMLCanvasElement | null} [options.getActiveCanvas]
+ * @param {() => void} options.pauseInput
+ * @param {() => void} options.resumeInput
+ * @param {() => void} [options.freezeFrameLoop]
+ * @param {() => void} [options.unfreezeFrameLoop]
+ * @param {() => Promise<boolean | { ok: boolean, pendingCount?: number }>} options.flushPendingWrites
+ * @param {(url: string) => void} options.navigate
+ * @param {(message: string) => void} [options.showFatal]
+ * @param {(canvas: HTMLCanvasElement | null) => boolean | Promise<boolean>} [options.onContextRestored]
+ * @param {(info: unknown) => boolean | Promise<boolean>} [options.tryWebGl2Fallback]
+ * @param {number} [options.restoreTimeoutMs=4000]
+ * @param {number} [options.maxContextLosses=3]
+ * @param {number} [options.lossWindowMs=30000]
+ * @param {() => number} [options.now]
+ * @param {(fn: () => void, ms: number) => unknown} [options.setTimer]
+ * @param {(handle: unknown) => void} [options.clearTimer]
+ */
+export function createGpuRecoveryController(options) {
+  const restoreTimeoutMs = Math.max(1, options.restoreTimeoutMs ?? 4000);
+  const maxContextLosses = Math.max(1, options.maxContextLosses ?? 3);
+  const lossWindowMs = Math.max(1, options.lossWindowMs ?? 30_000);
+  const now = options.now || (() => Date.now());
+  const setTimer = options.setTimer || ((fn, ms) => setTimeout(fn, ms));
+  const clearTimer =
+    options.clearTimer || (handle => clearTimeout(/** @type {any} */ (handle)));
+
+  /** @type {'ready' | 'context-lost' | 'fallback-pending' | 'fallback-blocked' | 'fallback-navigated' | 'fatal'} */
+  let status = 'ready';
+  let inputPaused = false;
+  let frameLoopFrozen = false;
+  let totalLossCount = 0;
+  let restoreCount = 0;
+  /** @type {number[]} */
+  let lossTimestamps = [];
+  /** @type {unknown} */
+  let restoreTimer = null;
+  /** @type {string | null} */
+  let lastError = null;
+  /** @type {string | null} */
+  let lastFallbackReason = null;
+  /** @type {string | null} */
+  let pendingFallbackUrl = null;
+  /** @type {((canvas: HTMLCanvasElement | null) => boolean | Promise<boolean>) | null} */
+  let onContextRestoredHook = options.onContextRestored || null;
+  /** @type {((info: unknown) => boolean | Promise<boolean>) | null} */
+  let tryWebGl2FallbackHook = options.tryWebGl2Fallback || null;
+
+  function clearRestoreTimer() {
+    if (restoreTimer !== null) {
+      clearTimer(restoreTimer);
+      restoreTimer = null;
+    }
+  }
+
+  function pauseAll() {
+    if (!inputPaused) {
+      inputPaused = true;
+      options.pauseInput();
+    }
+    if (!frameLoopFrozen) {
+      frameLoopFrozen = true;
+      options.freezeFrameLoop?.();
+    }
+  }
+
+  function resumeAll() {
+    if (frameLoopFrozen) {
+      frameLoopFrozen = false;
+      options.unfreezeFrameLoop?.();
+    }
+    if (inputPaused) {
+      inputPaused = false;
+      options.resumeInput();
+    }
+  }
+
+  /**
+   * Flushes pending IndexedDB writes and navigates to `?shell=legacy` only
+   * after persistence succeeds. Aborts navigation and exposes a retryable
+   * error state if persistence fails.
+   *
+   * @param {string} [reason='runtime-gpu-loss']
+   * @returns {Promise<{ navigated: boolean, retryable?: boolean, reason?: string }>}
+   */
+  async function triggerFallback(reason = 'runtime-gpu-loss') {
+    clearRestoreTimer();
+    pauseAll();
+    lastFallbackReason = reason;
+
+    if (isLegacyShellUrl(options.getHref())) {
+      status = 'fatal';
+      lastError = 'already-legacy';
+      options.showFatal?.('Graphics context was lost.');
+      return { navigated: false, retryable: false, reason: 'already-legacy' };
+    }
+
+    const fallback = buildLegacyFallbackUrl(options.getHref(), {
+      codeConsumed: options.isOAuthCodeConsumed(),
+    });
+    status = 'fallback-pending';
+    pendingFallbackUrl = fallback.url;
+
+    const result = await flushBeforeNavigation({
+      pauseInput: () => pauseAll(),
+      flushPendingWrites: options.flushPendingWrites,
+      navigate: options.navigate,
+      targetUrl: fallback.url,
+    });
+
+    if (result.navigated) {
+      status = 'fallback-navigated';
+      lastError = null;
+      pendingFallbackUrl = null;
+      return { navigated: true };
+    }
+
+    status = 'fallback-blocked';
+    lastError = result.reason || 'flush-rejected';
+    options.showFatal?.(
+      'Unable to save pending edits. Retry before switching shell.'
+    );
+    return {
+      navigated: false,
+      retryable: true,
+      reason: lastError,
+    };
+  }
+
+  /**
+   * Handles `#app-canvas` `webglcontextlost`. Calls `preventDefault()`, pauses
+   * input, freezes the frame loop, and starts the restore timeout.
+   *
+   * @param {Event | null | undefined} event
+   * @returns {{ tripped: boolean, lossCountInWindow: number }}
+   */
+  function handleWebGlContextLost(event) {
+    if (event && typeof event.preventDefault === 'function') {
+      event.preventDefault();
+    }
+    if (status === 'fallback-navigated' || status === 'fatal') {
+      return { tripped: false, lossCountInWindow: lossTimestamps.length };
+    }
+
+    pauseAll();
+    const t = now();
+    totalLossCount += 1;
+    lossTimestamps = lossTimestamps.filter(ts => t - ts <= lossWindowMs);
+    lossTimestamps.push(t);
+
+    if (lossTimestamps.length >= maxContextLosses) {
+      void triggerFallback('context-loss-threshold');
+      return { tripped: true, lossCountInWindow: lossTimestamps.length };
+    }
+
+    status = 'context-lost';
+    clearRestoreTimer();
+    restoreTimer = setTimer(() => {
+      restoreTimer = null;
+      void triggerFallback('context-restore-timeout');
+    }, restoreTimeoutMs);
+
+    return { tripped: false, lossCountInWindow: lossTimestamps.length };
+  }
+
+  /**
+   * Handles `#app-canvas` `webglcontextrestored`. Rebuilds render targets and
+   * redraws immediately, then resumes the frame loop and input delivery.
+   *
+   * @returns {Promise<{ recovered: boolean, reason?: string }>}
+   */
+  async function handleWebGlContextRestored() {
+    clearRestoreTimer();
+    if (status === 'fallback-navigated' || status === 'fatal') {
+      return { recovered: false, reason: status };
+    }
+    try {
+      const rebuilt = onContextRestoredHook
+        ? await onContextRestoredHook(options.getActiveCanvas?.() ?? null)
+        : true;
+      if (!rebuilt) {
+        await triggerFallback('context-restore-failed');
+        return { recovered: false, reason: 'context-restore-failed' };
+      }
+      restoreCount += 1;
+      status = 'ready';
+      lastError = null;
+      pendingFallbackUrl = null;
+      resumeAll();
+      return { recovered: true };
+    } catch {
+      await triggerFallback('context-restore-failed');
+      return { recovered: false, reason: 'context-restore-failed' };
+    }
+  }
+
+  /**
+   * Handles WebGPU `device.lost`. Tries WebGL2 downgrade when a fallback hook
+   * is provided; triggers the IDB-flushed legacy circuit breaker otherwise.
+   *
+   * @param {unknown} info
+   * @param {{ tryWebGl2Fallback?: (info: unknown) => boolean | Promise<boolean> }} [override]
+   * @returns {Promise<{ recovered: boolean, mode?: string, navigated?: boolean, retryable?: boolean, reason?: string }>}
+   */
+  async function handleWebGpuDeviceLost(info, override = {}) {
+    clearRestoreTimer();
+    pauseAll();
+    const fallbackFn = override.tryWebGl2Fallback || tryWebGl2FallbackHook;
+    if (typeof fallbackFn === 'function') {
+      try {
+        const ok = await fallbackFn(info);
+        if (ok) {
+          restoreCount += 1;
+          status = 'ready';
+          lastError = null;
+          pendingFallbackUrl = null;
+          resumeAll();
+          return { recovered: true, mode: 'webgl2' };
+        }
+      } catch {
+        // Fall through to unrecoverable circuit breaker.
+      }
+    }
+    const res = await triggerFallback('webgpu-device-lost');
+    return { recovered: false, ...res };
+  }
+
+  /**
+   * Retries a blocked legacy fallback after an IndexedDB flush error.
+   */
+  async function retryFallback() {
+    return triggerFallback(lastFallbackReason || 'retry-fallback');
+  }
+
+  /**
+   * Updates recovery hooks after app entry boot.
+   *
+   * @param {{ onContextRestored?: (canvas: HTMLCanvasElement | null) => boolean | Promise<boolean>, tryWebGl2Fallback?: (info: unknown) => boolean | Promise<boolean> }} hooks
+   */
+  function setHooks(hooks) {
+    if (hooks.onContextRestored !== undefined) {
+      onContextRestoredHook = hooks.onContextRestored;
+    }
+    if (hooks.tryWebGl2Fallback !== undefined) {
+      tryWebGl2FallbackHook = hooks.tryWebGl2Fallback;
+    }
+  }
+
+  function dispose() {
+    clearRestoreTimer();
+  }
+
+  return {
+    handleWebGlContextLost,
+    handleWebGlContextRestored,
+    handleWebGpuDeviceLost,
+    triggerFallback,
+    retryFallback,
+    setHooks,
+    dispose,
+    getState: () => ({
+      status,
+      inputPaused,
+      frameLoopFrozen,
+      totalLossCount,
+      restoreCount,
+      lossCountInWindow: lossTimestamps.length,
+      retryable: status === 'fallback-blocked',
+      lastError,
+      lastFallbackReason,
+      pendingFallbackUrl,
+    }),
+  };
+}
+
+/**
  * Displays a fatal boot error inside `#boot`.
  *
  * @param {Document} doc
@@ -418,6 +704,18 @@ export function showBootFatal(doc, message) {
  * @param {typeof BroadcastChannel} [env.BroadcastChannelImpl]
  * @param {ReturnType<typeof createIdbWorkspaceStorage>} [env.workspaceStorage]
  * @param {() => number} [env.now]
+ * @param {(fn: () => void, ms: number) => unknown} [env.setTimer]
+ * @param {(handle: unknown) => void} [env.clearTimer]
+ * @param {number} [env.restoreTimeoutMs]
+ * @param {number} [env.maxContextLosses]
+ * @param {number} [env.lossWindowMs]
+ * @param {() => void} [env.onFreezeFrameLoop]
+ * @param {() => void} [env.onUnfreezeFrameLoop]
+ * @param {(canvas: HTMLCanvasElement | null) => boolean | Promise<boolean>} [env.onContextRestored]
+ * @param {(info: unknown) => boolean | Promise<boolean>} [env.tryWebGl2Fallback]
+ * @param {string | null} [env.assetBaseUrl]
+ * @param {string} [env.buildId]
+ * @param {number} [env.pdfCacheMaxBytes]
  */
 export async function bootWebHost(env = {}) {
   const win = env.win || globalThis.window;
@@ -502,6 +800,12 @@ export async function bootWebHost(env = {}) {
   const manifest = readEmbeddedManifest(doc);
   const workerLoader = createWorkerLoader(manifest, {
     baseUrl: win.location.href,
+    assetBaseUrl: env.assetBaseUrl,
+    buildId: env.buildId,
+  });
+  const pdfClient = createPdfPreviewClient({
+    workerLoader,
+    maxCacheBytes: env.pdfCacheMaxBytes,
   });
 
   const safeAreaObserver = probe
@@ -519,6 +823,11 @@ export async function bootWebHost(env = {}) {
         ime,
         embedLayer,
       })
+    : null;
+
+  let selectionOverlayActive = false;
+  const imeSelectionGuard = ime
+    ? attachImeSelectionGuard(ime, () => selectionOverlayActive)
     : null;
 
   let oauthCodeConsumed = false;
@@ -544,23 +853,46 @@ export async function bootWebHost(env = {}) {
     });
   }
 
+  const gpuRecovery = createGpuRecoveryController({
+    getHref: () => win.location.href,
+    isOAuthCodeConsumed: () => oauthCodeConsumed,
+    getActiveCanvas: () => boundCanvas,
+    pauseInput() {
+      if (ime) {
+        ime.readOnly = true;
+      }
+    },
+    resumeInput() {
+      if (ime) {
+        ime.readOnly = false;
+      }
+    },
+    freezeFrameLoop: env.onFreezeFrameLoop,
+    unfreezeFrameLoop: env.onUnfreezeFrameLoop,
+    flushPendingWrites: resolveFlush,
+    navigate: url => win.location.assign(url),
+    showFatal: message => showBootFatal(doc, message),
+    onContextRestored: env.onContextRestored,
+    tryWebGl2Fallback: env.tryWebGl2Fallback,
+    restoreTimeoutMs: env.restoreTimeoutMs,
+    maxContextLosses: env.maxContextLosses,
+    lossWindowMs: env.lossWindowMs,
+    now: env.now,
+    setTimer: env.setTimer,
+    clearTimer: env.clearTimer,
+  });
+
   async function handleRuntimeGpuLoss() {
-    if (isLegacyShellUrl(win.location.href)) {
-      showBootFatal(doc, 'Graphics context was lost.');
-      return { navigated: false, reason: 'already-legacy' };
-    }
-    const fallback = buildLegacyFallbackUrl(win.location.href, {
-      codeConsumed: oauthCodeConsumed,
-    });
-    return navigateWithFlush(fallback.url);
+    return gpuRecovery.triggerFallback('runtime-gpu-loss');
   }
 
   /** @param {Event} event */
   function onContextLost(event) {
-    if (event && typeof event.preventDefault === 'function') {
-      event.preventDefault();
-    }
-    void handleRuntimeGpuLoss();
+    gpuRecovery.handleWebGlContextLost(event);
+  }
+
+  function onContextRestored() {
+    void gpuRecovery.handleWebGlContextRestored();
   }
 
   /** @param {HTMLCanvasElement | null} activeCanvas */
@@ -570,18 +902,26 @@ export async function bootWebHost(env = {}) {
     }
     if (boundCanvas && typeof boundCanvas.removeEventListener === 'function') {
       boundCanvas.removeEventListener('webglcontextlost', onContextLost);
+      boundCanvas.removeEventListener(
+        'webglcontextrestored',
+        onContextRestored
+      );
     }
     boundCanvas = activeCanvas || null;
     if (boundCanvas && typeof boundCanvas.addEventListener === 'function') {
       boundCanvas.addEventListener('webglcontextlost', onContextLost);
+      boundCanvas.addEventListener('webglcontextrestored', onContextRestored);
     }
   }
 
-  /** @param {{ lost?: Promise<unknown> } | null | undefined} device */
-  function bindWebGpuDevice(device) {
+  /**
+   * @param {{ lost?: Promise<unknown> } | null | undefined} device
+   * @param {{ tryWebGl2Fallback?: (info: unknown) => boolean | Promise<boolean> }} [deviceOpts]
+   */
+  function bindWebGpuDevice(device, deviceOpts = {}) {
     if (device && device.lost && typeof device.lost.then === 'function') {
-      void device.lost.then(() => {
-        void handleRuntimeGpuLoss();
+      void device.lost.then(info => {
+        void gpuRecovery.handleWebGpuDeviceLost(info, deviceOpts);
       });
     }
   }
@@ -683,9 +1023,24 @@ export async function bootWebHost(env = {}) {
       return { workspaceStorage, pendingWrites, v1Reader };
     },
     workerLoader,
+    pdfClient,
+    gpuRecovery,
     safeAreaObserver,
     navigateWithFlush,
     handleRuntimeGpuLoss,
+    retryGpuFallback: () => gpuRecovery.retryFallback(),
+    setGraphicsRecoveryHooks: hooks => gpuRecovery.setHooks(hooks),
+    setSelectionOverlayActive: active => {
+      selectionOverlayActive = Boolean(active);
+    },
+    executeClipboardAction: params =>
+      executeClipboardAction({
+        ...params,
+        clipboard: params.clipboard ?? win.navigator?.clipboard ?? null,
+        isSecureContext: params.isSecureContext ?? win.isSecureContext ?? true,
+        imeEl: ime,
+        doc,
+      }),
     markOAuthCodeConsumed: () => {
       oauthCodeConsumed = true;
     },
@@ -766,6 +1121,10 @@ export async function bootWebHost(env = {}) {
       localWorkspaceListeners.clear();
       workspaceStorage?.close();
       safeAreaObserver?.dispose();
+      imeSelectionGuard?.dispose();
+      gpuRecovery.dispose();
+      pdfClient.dispose();
+      workerLoader.dispose();
       bindCanvas(null);
     },
   };

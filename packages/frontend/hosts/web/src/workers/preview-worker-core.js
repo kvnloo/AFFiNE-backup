@@ -262,6 +262,14 @@ export function startPreviewWorker(kind) {
           frame.byteLength
         );
         const pageCount = view.getUint32(1, true);
+        if (msg.op === 'page_count') {
+          globalThis.postMessage({
+            id,
+            ok: true,
+            result: { kind, pageCount },
+          });
+          return;
+        }
         const widthPx = view.getUint32(5, true);
         const heightPx = view.getUint32(9, true);
         const rgba = frame.slice(13);
