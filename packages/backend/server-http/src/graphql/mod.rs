@@ -12,6 +12,7 @@ pub mod license;
 pub mod mcp;
 pub mod notification;
 pub mod search;
+pub mod transcript;
 pub mod user;
 pub mod workspace;
 
@@ -532,6 +533,7 @@ pub struct MutationRoot(
   mcp::McpMutation,
   billing::BillingMutation,
   copilot::CopilotMutation,
+  transcript::TranscriptMutation,
 );
 
 pub fn build_schema(state: Arc<AppState>) -> AppSchema {
@@ -1529,6 +1531,7 @@ mod tests {
       "McpMutation",
       "BillingMutation",
       "CopilotMutation",
+      "TranscriptMutation",
     ] {
       assert!(
         !actual_defs.contains_key(&format!("type {internal_name}")),
