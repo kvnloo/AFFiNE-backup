@@ -152,6 +152,12 @@ pub struct PlaygroundView {
     /// What each referenced image shows. An entry without a pending fetch was decoded
     /// from its blob and is final.
     pub(crate) images: HashMap<String, ImageSlot>,
+    /// Rasterized PDF attachment previews keyed by attachment block id.
+    pub(crate) pdf_previews: HashMap<String, block_flow::PdfPreviewPage>,
+    /// Active 0-based page index for each embedded PDF attachment block id.
+    pub(crate) pdf_page_indices: HashMap<String, usize>,
+    /// Most recent document id opened via clicking an `embed-linked-doc` / `embed-synced-doc` card.
+    pub(crate) last_opened_embed_doc: Option<String>,
     pub(crate) blob_fetches: BTreeMap<String, BlobFetchState>,
     pub(crate) dirty_text: Option<BTreeSet<String>>,
     pub(crate) doc_rev: u64,
@@ -249,6 +255,9 @@ impl PlaygroundView {
             preflight_renamed_title: None,
             pending_sync_since_sv: BTreeMap::new(),
             images: HashMap::new(),
+            pdf_previews: HashMap::new(),
+            pdf_page_indices: HashMap::new(),
+            last_opened_embed_doc: None,
             blob_fetches: BTreeMap::new(),
             dirty_text: None,
             doc_rev: 0,
@@ -315,6 +324,16 @@ impl PlaygroundView {
 
     pub fn theme(&self) -> PlaygroundTheme {
         self.theme
+    }
+
+    /// Most recent document id opened by clicking an embedded linked/synced document card.
+    pub fn last_opened_embed_doc(&self) -> Option<&str> {
+        self.last_opened_embed_doc.as_deref()
+    }
+
+    /// Active 0-based PDF preview page index for an attachment block.
+    pub fn attachment_pdf_page_index(&self, block_id: &str) -> Option<usize> {
+        self.pdf_previews.get(block_id).map(|p| p.page_index)
     }
 
     pub fn edgeless_camera(&self) -> edgeless::EdgelessCamera {
@@ -428,6 +447,9 @@ impl PlaygroundView {
         self.preflight_renamed_title = None;
         self.pending_sync_since_sv.clear();
         self.images.clear();
+        self.pdf_previews.clear();
+        self.pdf_page_indices.clear();
+        self.last_opened_embed_doc = None;
         self.blob_fetches.clear();
         self.scroll_y = 0.0;
         self.refresh_document();
@@ -528,16 +550,48 @@ impl PlaygroundView {
         self.edgeless_refresh_label_editor_from_snapshot();
 
         let mut referenced = BTreeSet::new();
+        let mut pdf_attachments: Vec<(String, String)> = Vec::new();
         for node in self
             .snapshot
             .iter()
             .flat_map(|snapshot| snapshot.root.iter())
             .flat_map(|root| root.walk())
         {
-            if let BlockContent::Image { source_id, .. } = &node.content
-                && !source_id.is_empty()
+            match &node.content {
+                BlockContent::Image { source_id, .. } if !source_id.is_empty() => {
+                    referenced.insert(source_id.clone());
+                }
+                BlockContent::Attachment {
+                    name,
+                    mime_type,
+                    source_id,
+                    embed,
+                    ..
+                } if !source_id.is_empty()
+                    && (*embed
+                        || mime_type.eq_ignore_ascii_case("application/pdf")
+                        || name.to_ascii_lowercase().ends_with(".pdf")) =>
+                {
+                    pdf_attachments.push((node.id.clone(), source_id.clone()));
+                }
+                _ => {}
+            }
+        }
+        for (block_id, source_id) in pdf_attachments {
+            let page_idx = self.pdf_page_indices.get(&block_id).copied().unwrap_or(0);
+            let needs_render = self
+                .pdf_previews
+                .get(&block_id)
+                .is_none_or(|p| p.page_index != page_idx);
+            if needs_render
+                && let Some(bytes) = self.state.blobs.get(&source_id)
+                && let Some(renderer) = block_flow::parse_pdf_renderer(bytes)
+                && let Some(preview) = block_flow::render_pdf_page(&renderer, page_idx, 1.5)
             {
-                referenced.insert(source_id.clone());
+                self.pdf_page_indices
+                    .insert(block_id.clone(), preview.page_index);
+                self.pdf_previews.insert(block_id, preview);
+                self.env_rev += 1;
             }
         }
         // Fetches of blobs the page no longer references stop. An ordinary document
@@ -678,6 +732,7 @@ impl PlaygroundView {
                 theme: self.theme,
                 page_titles: &self.page_titles,
                 images: &self.images,
+                pdf_previews: Some(&self.pdf_previews),
                 env_rev: self.env_rev,
                 direction: window.layout_direction(),
             },

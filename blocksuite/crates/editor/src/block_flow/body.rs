@@ -28,6 +28,12 @@ pub enum FlowKind {
     Image,
     Bookmark,
     Latex,
+    Callout,
+    Table,
+    Attachment,
+    EmbedLinkedDoc,
+    EmbedSyncedDoc,
+    SurfaceRef,
     Unknown,
 }
 
@@ -132,6 +138,23 @@ pub struct FlowText {
     pub layout: FlowTextLayout,
 }
 
+/// Interactive Prev/Next hit targets of an embedded PDF attachment block, relative to the block.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AttachmentPdfControls {
+    pub prev: FlowRect,
+    pub next: FlowRect,
+    pub page_index: usize,
+    pub page_count: usize,
+}
+
+/// Interactive hit target of one `affine:table` cell, relative to the block.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TableCellHit {
+    pub row_id: String,
+    pub column_id: String,
+    pub rect: FlowRect,
+}
+
 /// Position-independent layout of one block: size, margins and paint primitives.
 pub struct BlockBody {
     pub kind: FlowKind,
@@ -146,6 +169,10 @@ pub struct BlockBody {
     pub prefix: Option<FlowRect>,
     /// Horizontal scroll range of an unwrapped code block whose lines overflow.
     pub code_scroll: Option<CodeScroll>,
+    /// Pagination buttons of an embedded PDF attachment block, if active.
+    pub pdf_controls: Option<AttachmentPdfControls>,
+    /// Cell hit boxes of an `affine:table` block.
+    pub table_cells: Vec<TableCellHit>,
     pub(super) prims: Vec<Prim>,
 }
 
@@ -437,7 +464,9 @@ pub struct FlowInput<'a> {
     pub page_titles: &'a BTreeMap<String, String>,
     /// Image blobs by `sourceId`; a missing entry is still loading.
     pub images: &'a HashMap<String, ImageSlot>,
-    /// Bumped whenever `page_titles` or `images` change.
+    /// Rasterized PDF attachment previews keyed by block id or `sourceId`.
+    pub pdf_previews: Option<&'a HashMap<String, super::PdfPreviewPage>>,
+    /// Bumped whenever `page_titles`, `images`, or `pdf_previews` change.
     pub env_rev: u64,
     /// Explicit layout direction supplied by the host shell.
     pub direction: ui::Direction,

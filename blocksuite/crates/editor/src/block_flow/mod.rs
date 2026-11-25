@@ -15,16 +15,22 @@ mod blocks;
 mod body;
 mod inline;
 mod layout;
+mod preview;
+mod rich_blocks;
 mod viewport;
 
 pub use body::{
-    BlockBody, BlockPaint, CodeScroll, FlowBlock, FlowInput, FlowKind, FlowLayout, FlowStats,
-    FlowText, FlowTextLayout, PagePaint, ScrolledCode, paint_chevron,
+    AttachmentPdfControls, BlockBody, BlockPaint, CodeScroll, FlowBlock, FlowInput, FlowKind,
+    FlowLayout, FlowStats, FlowText, FlowTextLayout, PagePaint, ScrolledCode, TableCellHit,
+    paint_chevron,
 };
 pub use inline::{
     ImageSlot, InlineAlign, InlineBaseline, InlineLayout, InlineStyle, decode_image, layout_inline,
 };
 pub use layout::BlockFlow;
+pub use preview::{
+    MathRenderSlot, PdfPreviewPage, parse_pdf_renderer, render_math_cached, render_pdf_page,
+};
 pub use viewport::{
     PAGE_SURFACE_ID, PageViewport, PresenceMark, RemotePoint, RemotePresence, RemoteSelection,
     page_elements,
@@ -523,6 +529,7 @@ mod tests {
             theme: crate::theme::PlaygroundTheme::Light,
             page_titles: &titles,
             images: &images,
+            pdf_previews: None,
             env_rev: 0,
             direction: Direction::Ltr,
         };

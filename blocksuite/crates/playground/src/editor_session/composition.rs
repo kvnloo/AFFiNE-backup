@@ -300,8 +300,9 @@ impl PlaygroundView {
                 draw(r, palette.brand.opacity(0.22), false);
             }
         }
-        // While the link field takes the keys, its caret is the only one shown.
-        if self.overlays.link_url().is_none()
+        // While an overlay text field (link bar or equation editor) takes keys,
+        // its caret is the only one shown.
+        if self.overlays.active_text_field().is_none()
             && let Some(p) = self.visual_focus()
             && let Some(rect) = layout
                 .block(&p.block_id)

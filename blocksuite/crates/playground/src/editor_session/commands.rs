@@ -51,7 +51,7 @@ impl PlaygroundView {
             }
         }
     }
-    pub(super) fn history(
+    pub(crate) fn history(
         &mut self,
         redo: bool,
         w: &mut Window,
@@ -339,7 +339,7 @@ impl PlaygroundView {
         self.did_edit(commit, (a == b).then_some(&start.block_id), w, cx);
         Ok(())
     }
-    pub(super) fn edit_key(
+    pub(crate) fn edit_key(
         &mut self,
         key: &str,
         shift: bool,

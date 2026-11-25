@@ -189,6 +189,101 @@ pub(super) fn shape(window: &Window, text: &str, style: &InlineStyle) -> ShapedL
     )
 }
 
+pub(super) fn shape_highlighted(
+    window: &Window,
+    text: &str,
+    style: &InlineStyle,
+    spans: &[crate::highlight::HighlightSpan],
+    mode: crate::theme::ThemeMode,
+) -> ShapedLine {
+    if text.is_empty() || spans.is_empty() {
+        return shape(window, text, style);
+    }
+    let font = style.font();
+    let mut runs = Vec::with_capacity(spans.len());
+    let mut cursor = 0usize;
+    for span in spans {
+        let start = span.bytes.start.min(text.len());
+        let end = span.bytes.end.min(text.len());
+        if start > cursor {
+            runs.push(TextRun {
+                len: start - cursor,
+                font: font.clone(),
+                color: style.color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            });
+        }
+        if end > start {
+            runs.push(TextRun {
+                len: end - start,
+                font: font.clone(),
+                color: crate::highlight::syntax_color(span.kind, mode),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            });
+            cursor = end;
+        }
+    }
+    if cursor < text.len() {
+        runs.push(TextRun {
+            len: text.len() - cursor,
+            font,
+            color: style.color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        });
+    }
+    window.text_system().shape_line(
+        SharedString::from(text.to_string()),
+        px(style.size),
+        &runs,
+        None,
+    )
+}
+
+/// Lay out a single unwrapped syntax-highlighted code line with exact caret geometry.
+pub(super) fn layout_highlighted_code_line(
+    line: &str,
+    style: &InlineStyle,
+    spans: &[crate::highlight::HighlightSpan],
+    mode: crate::theme::ThemeMode,
+    line_height: f32,
+    window: &Window,
+) -> InlineLayout {
+    let baseline = baseline_in_line(line_height, &shape(window, "Ag", style));
+    if line.is_empty() {
+        return InlineLayout {
+            pieces: Vec::new(),
+            line_count: 1,
+            line_height,
+            width: f32::MAX,
+            baseline,
+        };
+    }
+    let shaped = shape_highlighted(window, line, style, spans, mode);
+    let visible_width = f32::from(shaped.width());
+    let source_len = line.encode_utf16().count();
+    InlineLayout {
+        pieces: vec![InlinePiece {
+            line: 0,
+            x: 0.0,
+            visible_width,
+            baseline_shift: baseline - baseline_in_line(line_height, &shaped),
+            shaped,
+            source_start: 0,
+            source_len,
+        }],
+        line_count: 1,
+        line_height,
+        width: f32::MAX,
+        baseline,
+    }
+}
+
 /// Split text into words that keep their trailing whitespace; `None` marks a hard break.
 pub(super) fn inline_segments(text: &str) -> Vec<Option<&str>> {
     let mut segments = Vec::new();

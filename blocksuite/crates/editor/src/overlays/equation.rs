@@ -73,22 +73,34 @@ impl Overlays {
         });
     }
 
-    /// Close the equation editor without committing.
+    /// Close the equation editor without committing (immediate drop).
     pub fn close_equation_editor(&mut self) {
         self.equation = None;
     }
 
-    pub(super) fn apply_equation(&mut self, effects: &mut OverlayEffects) {
-        let Some(editor) = self.equation.take() else {
+    /// Close the equation editor with a 150 ms fade-out transition.
+    pub fn close_equation_editor_at(&mut self, now_ms: f64) -> bool {
+        match self.equation_editor_mut() {
+            Some(editor) => {
+                editor.presence.close(now_ms);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub(super) fn apply_equation(&mut self, now_ms: f64, effects: &mut OverlayEffects) {
+        let Some(editor) = self.equation_editor_mut() else {
             return;
         };
-        let latex = editor.input.into_committed_text();
+        let latex = editor.input.clone().into_committed_text();
         if latex != editor.initial_latex {
             effects.edits.push(DocEdit::Equation {
-                target: editor.target,
+                target: editor.target.clone(),
                 latex,
             });
         }
+        editor.presence.close(now_ms);
         effects.redraw = true;
     }
 
@@ -161,17 +173,40 @@ impl Overlays {
         let mut font = ui::font(FONT_CODE);
         font.weight = FontWeight::NORMAL;
         let shown = SharedString::from(text.clone());
-        let line = window.text_system().shape_line(
-            shown.clone(),
-            px(TYPOGRAPHY.font_xs_px),
-            &[TextRun {
+        let latex_hl = crate::highlight::highlight_line(
+            crate::highlight::LanguageId::Latex,
+            &text,
+            crate::highlight::LineState::Normal,
+        );
+        let theme_mode = palette.theme.mode();
+        let latex_runs: Vec<TextRun> = if latex_hl.spans.is_empty() {
+            vec![TextRun {
                 len: shown.len(),
-                font,
+                font: font.clone(),
                 color: palette.text_primary,
                 background_color: None,
                 underline: None,
                 strikethrough: None,
-            }],
+            }]
+        } else {
+            latex_hl
+                .spans
+                .iter()
+                .filter(|s| s.bytes.end > s.bytes.start)
+                .map(|s| TextRun {
+                    len: s.bytes.end - s.bytes.start,
+                    font: font.clone(),
+                    color: crate::highlight::syntax_color(s.kind, theme_mode),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                })
+                .collect()
+        };
+        let line = window.text_system().shape_line(
+            shown.clone(),
+            px(TYPOGRAPHY.font_xs_px),
+            &latex_runs,
             None,
         );
         let x_at = |offset: usize| f32::from(line.x_for_index(utf16_to_byte(&text, offset)));

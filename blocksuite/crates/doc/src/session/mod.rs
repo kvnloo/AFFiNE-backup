@@ -520,4 +520,55 @@ impl PageDocSession {
         let target = TypeTarget::Path(TypePath::root("blocks").key(block_id));
         Ok(self.session.map_set(&target, prop_key.into(), value)?)
     }
+
+    /// Replace the text inside one `affine:table` cell as a single undoable transaction.
+    pub fn set_table_cell_text(
+        &mut self,
+        block_id: &str,
+        row_id: &str,
+        column_id: &str,
+        text: &str,
+        now_ms: u64,
+    ) -> DocResult<Option<SessionCommit<SelectionSnapshot>>> {
+        let cell_key = format!("{row_id}:{column_id}");
+        let cells_target =
+            TypeTarget::Path(TypePath::root("blocks").key(block_id).key("prop:cells"));
+        let existing_text = match self.session.get_map_value(&cells_target, &cell_key)? {
+            Some(SessionReadValue::Map(cell_id)) => match self
+                .session
+                .get_map_value(&TypeTarget::Identity(cell_id), "text")?
+            {
+                Some(SessionReadValue::Text(text_id)) => Some(TypeTarget::Identity(text_id)),
+                _ => None,
+            },
+            _ => None,
+        };
+        let text = text.to_string();
+        self.structural_edit(now_ms, move |page| {
+            if let Some(text_target) = existing_text.clone() {
+                let len = page.session.read_text_len(&text_target)?;
+                if len > 0 {
+                    page.session.text_remove(&text_target, 0, len)?;
+                }
+                if !text.is_empty() {
+                    page.session.text_insert(&text_target, 0, &text)?;
+                }
+            } else {
+                let delta = if text.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![TextDeltaOp::Insert {
+                        insert: TextInsert::Text(text.clone()),
+                        format: None,
+                    }]
+                };
+                page.session.map_set(
+                    &cells_target,
+                    cell_key.clone(),
+                    SessionValue::Map(vec![("text".to_string(), SessionValue::Text(delta))]),
+                )?;
+            }
+            Ok(())
+        })
+    }
 }

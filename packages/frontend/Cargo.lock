@@ -532,6 +532,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blocksuite-playground-doc",
+ "blocksuite-preview",
+ "icu_segmenter",
  "image",
  "serde",
  "serde_json",

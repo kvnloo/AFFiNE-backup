@@ -417,6 +417,8 @@ impl<'a> FlowPass<'a> {
             }),
             prefix: None,
             code_scroll: None,
+            pdf_controls: None,
+            table_cells: Vec::new(),
         }
     }
 
@@ -477,6 +479,37 @@ impl<'a> FlowPass<'a> {
                 width,
             ),
             BlockContent::Latex { latex } => self.latex_body(latex, width),
+            BlockContent::Callout {
+                icon,
+                background_color,
+            } => self.callout_body(
+                icon,
+                background_color.as_deref(),
+                !node.children.is_empty(),
+                width,
+            ),
+            BlockContent::Table(table) => self.table_body(table, width),
+            BlockContent::Attachment {
+                name,
+                size,
+                mime_type,
+                source_id,
+                caption,
+                embed,
+            } => self.attachment_body(
+                &node.id, name, *size, mime_type, source_id, caption, *embed, width,
+            ),
+            BlockContent::EmbedLinkedDoc {
+                page_id, caption, ..
+            } => self.embed_linked_doc_body(page_id, caption, width),
+            BlockContent::EmbedSyncedDoc { page_id, caption } => {
+                self.embed_synced_doc_body(page_id, caption, width)
+            }
+            BlockContent::SurfaceRef {
+                reference,
+                ref_flavour,
+                caption,
+            } => self.surface_ref_body(reference, ref_flavour, caption, width),
             _ => self.unknown_body(&node.flavour, &node.id, width),
         }
     }

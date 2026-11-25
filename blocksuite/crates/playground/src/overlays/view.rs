@@ -123,6 +123,7 @@ impl PlaygroundView {
             }
             OverlayEvent::DragStart(_) => self.editor.dragging = false,
             _ if self.handle_linked_doc_event(&event, window, cx) => return,
+            _ if self.handle_mobile_and_rich_event(&event, window, cx) => return,
             _ => {}
         }
         let now_ms = self.now_ms(cx);

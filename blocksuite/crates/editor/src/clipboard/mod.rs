@@ -1,5 +1,7 @@
-//! BlockSuite's slice snapshot and its two textual clipboard representations.
+//! BlockSuite's slice snapshot and its textual clipboard representations (HTML & Markdown).
 mod html;
+pub mod markdown;
+pub mod sanitize;
 
 use std::collections::BTreeMap;
 
@@ -363,6 +365,16 @@ impl Slice {
         .then_some(slice)
     }
 
+    pub fn to_markdown(&self) -> String {
+        markdown::slice_to_markdown(self)
+    }
+
+    pub fn from_markdown(md: &str) -> Option<Self> {
+        let mut slice = markdown::parse_markdown_blocks(md)?;
+        sanitize::sanitize_slice(&mut slice);
+        Some(slice)
+    }
+
     pub fn from_html(html: &str) -> Option<Self> {
         if let Some((_, after)) = html.split_once("data-blocksuite-snapshot=\"")
             && let Some((encoded, _)) = after.split_once('"')
@@ -370,11 +382,14 @@ impl Slice {
             && let Ok(map) = serde_json::from_str::<Value>(&decoded)
             && let Some(raw) = map["BLOCKSUITE/SNAPSHOT"].as_str()
             && let Ok(wrapped) = serde_json::from_str::<Value>(raw)
-            && let Some(slice) = Self::parse_json(wrapped["snapshot"].clone())
+            && let Some(mut slice) = Self::parse_json(wrapped["snapshot"].clone())
         {
+            sanitize::sanitize_slice(&mut slice);
             return Some(slice);
         }
-        parse_html_blocks(html)
+        let mut slice = parse_html_blocks(html)?;
+        sanitize::sanitize_slice(&mut slice);
+        Some(slice)
     }
 }
 
@@ -484,5 +499,73 @@ mod tests {
         );
         assert_eq!(Slice::from_html(&slice.html()), Some(slice.clone()));
         assert_eq!(Slice::from_item(&slice.item()), Some(slice));
+    }
+
+    #[test]
+    fn html_and_markdown_sanitize_xss_vectors_and_preserve_rich_blocks() {
+        let xss_html = concat!(
+            "<script>alert('xss')</script>",
+            "<style>body{display:none}</style>",
+            "<iframe src='https://evil.test'></iframe>",
+            "<object data='evil.swf'></object>",
+            "<p onclick='alert(1)'>Safe <strong>bold</strong> ",
+            "<a href='javascript:alert(1)' onmouseover='evil()'>bad1</a> ",
+            "<a href='j&#x61;vascript:alert(2)'>bad2</a> ",
+            "<a href='vbscript:msgbox(1)'>bad3</a> ",
+            "<a href='data:text/html,<script>alert(1)</script>'>bad4</a> ",
+            "<a href='https://affine.pro'>good</a></p>",
+            "<table><tr><th>K</th><th>V</th></tr><tr><td>A</td><td>1</td></tr></table>",
+        );
+        let slice = Slice::from_html(xss_html).expect("sanitized slice");
+        let plain = slice.plain();
+        assert!(!plain.contains("alert("), "script payload leaked: {plain}");
+        assert!(
+            !plain.contains("display:none"),
+            "style payload leaked: {plain}"
+        );
+        assert!(plain.contains("Safe bold bad1 bad2 bad3 bad4 good"));
+        let ops = slice.content[0].delta();
+        let links: Vec<&str> = ops
+            .iter()
+            .filter_map(|op| match op {
+                TextDeltaOp::Insert {
+                    format: Some(attrs),
+                    ..
+                } => match attrs.get("link") {
+                    Some(y_octo::Any::String(url)) => Some(url.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(links, vec!["https://affine.pro"]);
+        assert_eq!(slice.content[1].flavour, "affine:table");
+
+        // Markdown roundtrip with rich blocks & XSS link stripping.
+        let md = concat!(
+            "# Heading\n\n",
+            "Text with **bold**, *italic*, `code`, $E=mc^2$, ",
+            "[safe](https://affine.pro) and [evil](javascript:alert(1)).\n\n",
+            "- [x] Ship S3\n",
+            "- [ ] Review\n\n",
+            "> [!NOTE]\n",
+            "> Callout line\n\n",
+            "| Col1 | Col2 |\n",
+            "| --- | --- |\n",
+            "| R1C1 | R1C2 |\n\n",
+            "```rust\nfn main() {}\n```\n",
+        );
+        let parsed = Slice::from_markdown(md).expect("markdown slice");
+        assert!(parsed.content.iter().any(|b| b.flavour == "affine:table"));
+        assert!(parsed.content.iter().any(|b| b.flavour == "affine:callout"));
+        assert!(parsed.content.iter().any(|b| b.flavour == "affine:code"));
+        assert!(parsed.content.iter().any(|b| b.flavour == "affine:list"));
+        let exported = parsed.to_markdown();
+        assert!(exported.contains("# Heading"));
+        assert!(exported.contains("https://affine.pro"));
+        assert!(!exported.contains("javascript:"));
+        assert!(exported.contains("- [x] Ship S3"));
+        assert!(exported.contains("| Col1 | Col2 |"));
+        assert!(exported.contains("```rust"));
     }
 }

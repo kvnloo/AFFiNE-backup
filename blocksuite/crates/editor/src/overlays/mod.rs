@@ -20,6 +20,7 @@
 //! be clicked.
 
 mod equation;
+mod keyboard_toolbar;
 mod paint_linked_doc;
 mod paint_page;
 mod paint_popovers;
@@ -28,6 +29,9 @@ mod state;
 mod toolbar;
 
 pub use equation::{EquationEditor, EquationTarget};
+pub use keyboard_toolbar::{
+    KEYBOARD_TOOLBAR_BUTTON, KEYBOARD_TOOLBAR_HEIGHT, KeyboardToolbarAction,
+};
 pub use paint_page::{block_text, bounding_rect, find_parent, shared_alignment};
 pub use slash::{
     SLASH_ITEMS, SlashCommand, SlashItem, SlashMenu, SlashRow, filter_slash_items, slash_rows,
@@ -451,6 +455,31 @@ pub enum OverlayEvent {
     EquationApply,
     /// Dismiss the equation editor without committing.
     CloseEquationEditor,
+    /// Show or hide the mobile bottom keyboard toolbar.
+    SetKeyboardToolbarVisible(bool),
+    /// Trigger one action button on the mobile bottom keyboard toolbar.
+    KeyboardToolbar(KeyboardToolbarAction),
+    /// Step the active PDF page preview of an `affine:attachment` block by `delta` (`-1` / `+1`).
+    AttachmentPdfPage {
+        block_id: String,
+        delta: i32,
+    },
+    /// Open the target document of an `affine:embed-linked-doc` or `affine:embed-synced-doc` card.
+    OpenEmbedDoc {
+        page_id: String,
+    },
+    /// Update text inside one cell of an `affine:table` block.
+    EditTableCell {
+        block_id: String,
+        row_id: String,
+        column_id: String,
+        text: String,
+    },
+    /// Touch long-press at window coordinates `(x, y)` to select the ICU word under the finger.
+    LongPressWord {
+        x: f32,
+        y: f32,
+    },
 }
 
 /// Active `@` linked-document menu state populated from [`crate::directory::WorkspaceDocDirectory`].
@@ -562,6 +591,7 @@ pub struct Overlays {
     pub(super) copied_generation: u64,
     pub(super) linked_doc: Option<LinkedDocMenuState>,
     pub(super) equation: Option<EquationEditor>,
+    pub(super) keyboard_toolbar_visible: bool,
     pub format_cache: Option<FormatCache>,
 }
 

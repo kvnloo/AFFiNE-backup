@@ -7,7 +7,7 @@ use blocksuite_playground_doc::{
     read::{BlockContent, BlockNode, PageSnapshot},
     session::{PageDocSession, SelectionSnapshot},
 };
-use unicode_segmentation::UnicodeSegmentation;
+use icu_segmenter::WordSegmenter;
 use y_octo::{Any, SessionCommit};
 
 use crate::{
@@ -182,14 +182,61 @@ impl EditorSession {
     }
 }
 
+/// Select the ICU word boundary span (in UTF-16 code units) containing `offset`.
+///
+/// Uses `icu_segmenter::WordSegmenter::new_dictionary` for accurate Latin, Arabic,
+/// Hebrew, CJK, and mixed bidirectional word selection.
 pub fn word_range(text: &str, offset: u64) -> Range<u64> {
+    if text.is_empty() {
+        return 0..0;
+    }
     let index = TextBiIndex::new(text);
     let byte = index.utf16_to_utf8_clamped(offset);
-    text.split_word_bound_indices()
-        .find(|(i, s)| i + s.len() > byte)
-        .or_else(|| text.split_word_bound_indices().next_back())
-        .map(|(i, s)| index.utf8_to_utf16(i)..index.utf8_to_utf16(i + s.len()))
+    let segmenter = WordSegmenter::new_dictionary(Default::default());
+    let boundaries: Vec<usize> = segmenter.segment_str(text).collect();
+    let mut found = None;
+    for pair in boundaries.windows(2) {
+        let (start, end) = (pair[0], pair[1]);
+        if end > byte {
+            found = Some((start, end));
+            break;
+        }
+    }
+    if found.is_none() && boundaries.len() >= 2 {
+        let last = boundaries.len() - 1;
+        found = Some((boundaries[last - 1], boundaries[last]));
+    }
+    found
+        .map(|(start, end)| index.utf8_to_utf16(start)..index.utf8_to_utf16(end))
         .unwrap_or(0..0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::word_range;
+
+    #[test]
+    fn icu_word_range_handles_mixed_ltr_arabic_and_hebrew_paragraph() {
+        let text =
+            "Hello \u{05E9}\u{05DC}\u{05D5}\u{05DD} \u{0645}\u{0631}\u{062D}\u{0628}\u{0627} world";
+        let slice_u16 = |range: std::ops::Range<u64>| -> String {
+            let units: Vec<u16> = text.encode_utf16().collect();
+            String::from_utf16(&units[range.start as usize..range.end as usize]).unwrap()
+        };
+        assert_eq!(slice_u16(word_range(text, 1)), "Hello");
+        // Hebrew word starts at UTF-16 offset 6 ("Hello " = 6 units)
+        assert_eq!(
+            slice_u16(word_range(text, 7)),
+            "\u{05E9}\u{05DC}\u{05D5}\u{05DD}"
+        );
+        // Arabic word starts at UTF-16 offset 11 ("Hello שלום " = 11 units)
+        assert_eq!(
+            slice_u16(word_range(text, 13)),
+            "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}"
+        );
+        // Trailing English word
+        assert_eq!(slice_u16(word_range(text, 18)), "world");
+    }
 }
 
 pub fn text_content(node: &BlockNode) -> Option<&str> {

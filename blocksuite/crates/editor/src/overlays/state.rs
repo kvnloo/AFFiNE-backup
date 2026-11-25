@@ -385,9 +385,9 @@ impl Overlays {
                 self.open_equation_editor(target, initial, now_ms);
                 effects.redraw = true;
             }
-            OverlayEvent::EquationApply => self.apply_equation(&mut effects),
+            OverlayEvent::EquationApply => self.apply_equation(now_ms, &mut effects),
             OverlayEvent::CloseEquationEditor => {
-                if self.equation.take().is_some() {
+                if self.close_equation_editor_at(now_ms) {
                     effects.redraw = true;
                 }
             }
@@ -396,7 +396,13 @@ impl Overlays {
             | OverlayEvent::LinkedDocHover(_)
             | OverlayEvent::LinkedDocSelect(_)
             | OverlayEvent::CloseLinkedDocMenu
-            | OverlayEvent::CreateLinkedDoc { .. } => {}
+            | OverlayEvent::CreateLinkedDoc { .. }
+            | OverlayEvent::SetKeyboardToolbarVisible(_)
+            | OverlayEvent::KeyboardToolbar(_)
+            | OverlayEvent::AttachmentPdfPage { .. }
+            | OverlayEvent::OpenEmbedDoc { .. }
+            | OverlayEvent::EditTableCell { .. }
+            | OverlayEvent::LongPressWord { .. } => {}
         }
         effects
     }
@@ -427,8 +433,10 @@ impl Overlays {
             effects.handled = true;
             effects.redraw = true;
             match key {
-                "enter" => self.apply_equation(&mut effects),
-                "escape" => self.close_equation_editor(),
+                "enter" => self.apply_equation(now_ms, &mut effects),
+                "escape" => {
+                    self.close_equation_editor_at(now_ms);
+                }
                 "v" if secondary => effects.paste = true,
                 "c" | "x" if secondary => {
                     if !equation.input.selection.is_empty() {
@@ -681,6 +689,11 @@ impl Overlays {
         {
             self.toolbar = None;
         }
+        if self.equation.as_ref().is_some_and(|editor| {
+            editor.presence.gone(now_ms) || layout.block(editor.target.block_id()).is_none()
+        }) {
+            self.equation = None;
+        }
     }
 
     pub(super) fn in_flight(&self, now_ms: f64) -> bool {
@@ -696,5 +709,9 @@ impl Overlays {
             || self.toolbar.as_ref().is_some_and(|toolbar| {
                 toolbar.presence.in_flight(now_ms) || toolbar.presence.closing
             })
+            || self
+                .equation
+                .as_ref()
+                .is_some_and(|editor| editor.presence.in_flight(now_ms) || editor.presence.closing)
     }
 }

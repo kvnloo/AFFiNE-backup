@@ -3,6 +3,7 @@
 mod view;
 mod view_edits;
 mod view_linked_doc;
+mod view_mobile;
 
 pub use blocksuite_editor::overlays::*;
 
@@ -2673,5 +2674,147 @@ mod tests {
             rtl_handle.x,
             h_rtl_bounds.x + h_rtl_bounds.width + CONTROL_HIT_SIZE
         );
+    }
+
+    #[test]
+    fn equation_editor_fades_in_and_out_on_scheduler_clock_and_suppresses_body_caret() {
+        let session = open(1280, 800, PlaygroundTheme::Light);
+        session.edit(|page| {
+            page.add_block(
+                "eq-block",
+                BlockSpec::Latex {
+                    latex: r"E = mc^2".into(),
+                },
+                Some("showcase-note"),
+                Some(1),
+                3_000_000,
+            )
+            .expect("add latex block");
+        });
+        session.select("showcase-intro", "bold");
+        let before = session.frame();
+        assert!(before.elements.contains_key("page.local_caret"));
+
+        // Open equation editor without sending any subsequent pointer or key events.
+        session.overlay(OverlayEvent::OpenEquationEditor {
+            target: EquationTarget::Block {
+                block_id: "eq-block".into(),
+            },
+            initial: r"E = mc^2".into(),
+        });
+        let first = session.frame();
+        let opened_first = element(&first, "overlay.equation_editor");
+        assert!(opened_first.opacity > 0.0 && opened_first.opacity <= 0.02);
+        // Body caret is suppressed while the equation editor owns the input caret.
+        assert!(
+            !first.elements.contains_key("page.local_caret"),
+            "body caret must be hidden while EquationEditor is open"
+        );
+
+        // Advance scheduler clock 150ms with zero input events: fade-in reaches opacity 1.0.
+        session.platform.advance_clock(Duration::from_millis(150));
+        session.platform.run_until_parked();
+        let settled = session.frame();
+        assert_eq!(element(&settled, "overlay.equation_editor").opacity, 1.0);
+        assert!(!settled.elements.contains_key("page.local_caret"));
+
+        // Close equation editor and advance 150ms with zero input events: unmounts cleanly.
+        session.overlay(OverlayEvent::CloseEquationEditor);
+        let closing = session.frame();
+        assert!(closing.elements.contains_key("page.local_caret"));
+        session.platform.advance_clock(Duration::from_millis(150));
+        session.platform.run_until_parked();
+        let closed = session.frame();
+        assert!(
+            !closed.elements.contains_key("overlay.equation_editor"),
+            "EquationEditor must unmount after 150ms fade-out"
+        );
+    }
+
+    #[test]
+    fn mobile_keyboard_toolbar_long_press_bidi_and_embed_doc_click_work_end_to_end() {
+        let session = open(390, 844, PlaygroundTheme::Light);
+        session.edit(|page| {
+            page.add_block(
+                "bidi-p",
+                BlockSpec::Paragraph {
+                    paragraph_type: ParagraphType::Text,
+                    text: "Hello \u{05E9}\u{05DC}\u{05D5}\u{05DD} \u{0645}\u{0631}\u{062D}\u{0628}\u{0627} world".into(),
+                },
+                Some("showcase-note"),
+                Some(0),
+                4_000_000,
+            )
+            .expect("add bidi paragraph");
+            page.add_block(
+                "embed-card",
+                BlockSpec::EmbedLinkedDoc {
+                    page_id: "doc:linked-target".into(),
+                    style: "horizontal".into(),
+                    caption: String::new(),
+                },
+                Some("showcase-note"),
+                Some(1),
+                4_000_001,
+            )
+            .expect("add embed card");
+        });
+
+        session.overlay(OverlayEvent::SetKeyboardToolbarVisible(true));
+        let frame = session.frame();
+        assert_no_violations(&frame, "mobile keyboard toolbar");
+        let bar = element(&frame, "overlay.keyboard_toolbar");
+        assert_eq!(bar.bounds.height, KEYBOARD_TOOLBAR_HEIGHT);
+        for id in [
+            "overlay.keyboard_toolbar.undo",
+            "overlay.keyboard_toolbar.bold",
+            "overlay.keyboard_toolbar.dismiss",
+        ] {
+            let btn = element(&frame, id);
+            assert!(
+                btn.bounds.width >= 44.0 && btn.bounds.height >= 44.0,
+                "{id} < 44x44"
+            );
+        }
+
+        // Long-press on the bidi paragraph selects an ICU word.
+        let bidi_bounds = element(&frame, "page.block.bidi-p").bounds;
+        session.overlay(OverlayEvent::LongPressWord {
+            x: bidi_bounds.x + 10.0,
+            y: bidi_bounds.y + 10.0,
+        });
+        let sel = session.selection().expect("word selection");
+        assert_eq!(sel.0, "bidi-p");
+        assert!(sel.3 > sel.1, "long-press must select a non-empty ICU word");
+
+        // Clicking Bold on KeyboardToolbar applies bold in one undoable step.
+        session.overlay(OverlayEvent::KeyboardToolbar(KeyboardToolbarAction::Bold));
+        let after_bold = session.text("bidi-p");
+        assert!(after_bold.delta.iter().any(|op| matches!(
+            op,
+            TextDeltaOp::Insert { format: Some(f), .. } if f.get("bold") == Some(&Any::True)
+        )));
+        session.overlay(OverlayEvent::KeyboardToolbar(KeyboardToolbarAction::Undo));
+        let after_undo = session.text("bidi-p");
+        assert!(after_undo.delta.iter().all(|op| !matches!(
+            op,
+            TextDeltaOp::Insert { format: Some(f), .. } if f.get("bold") == Some(&Any::True)
+        )));
+
+        // Clicking EmbedLinkedDoc triggers OpenEmbedDoc callback state.
+        session.overlay(OverlayEvent::OpenEmbedDoc {
+            page_id: "doc:linked-target".into(),
+        });
+        assert_eq!(
+            session.view(|v, _| v.last_opened_embed_doc().map(str::to_string)),
+            Some("doc:linked-target".to_string())
+        );
+
+        // Dismiss hides the keyboard toolbar.
+        session.overlay(OverlayEvent::KeyboardToolbar(
+            KeyboardToolbarAction::Dismiss,
+        ));
+        let dismissed = session.frame();
+        assert!(!dismissed.elements.contains_key("overlay.keyboard_toolbar"));
     }
 }

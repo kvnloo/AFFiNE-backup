@@ -52,6 +52,35 @@ pub enum BlockSpec {
     Latex {
         latex: String,
     },
+    Callout {
+        icon: String,
+        background_color: Option<String>,
+    },
+    Table {
+        rows: Vec<Vec<String>>,
+    },
+    Attachment {
+        name: String,
+        size: i64,
+        mime_type: String,
+        source_id: String,
+        caption: String,
+        embed: bool,
+    },
+    EmbedLinkedDoc {
+        page_id: String,
+        style: String,
+        caption: String,
+    },
+    EmbedSyncedDoc {
+        page_id: String,
+        caption: String,
+    },
+    SurfaceRef {
+        reference: String,
+        ref_flavour: String,
+        caption: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,7 +157,16 @@ fn color_map(dark: &str, light: &str) -> SessionValue {
 pub fn is_leaf_flavour(flavour: &str) -> bool {
     matches!(
         flavour,
-        "affine:code" | "affine:divider" | "affine:image" | "affine:bookmark" | "affine:latex"
+        "affine:code"
+            | "affine:divider"
+            | "affine:image"
+            | "affine:bookmark"
+            | "affine:latex"
+            | "affine:table"
+            | "affine:attachment"
+            | "affine:embed-linked-doc"
+            | "affine:embed-synced-doc"
+            | "affine:surface-ref"
     )
 }
 
@@ -147,6 +185,12 @@ impl BlockSpec {
             Self::Frame { .. } => "affine:frame",
             Self::EdgelessText { .. } => "affine:edgeless-text",
             Self::Latex { .. } => "affine:latex",
+            Self::Callout { .. } => "affine:callout",
+            Self::Table { .. } => "affine:table",
+            Self::Attachment { .. } => "affine:attachment",
+            Self::EmbedLinkedDoc { .. } => "affine:embed-linked-doc",
+            Self::EmbedSyncedDoc { .. } => "affine:embed-synced-doc",
+            Self::SurfaceRef { .. } => "affine:surface-ref",
         }
     }
 
@@ -491,6 +535,248 @@ impl BlockSpec {
                     (
                         "prop:latex".to_string(),
                         SessionValue::Any(Any::String(latex)),
+                    ),
+                ]);
+            }
+            Self::Callout {
+                icon,
+                background_color,
+            } => {
+                let bg = background_color.unwrap_or_else(|| "var(--affine-tag-blue)".to_string());
+                entries.extend([
+                    (
+                        "prop:backgroundColor".to_string(),
+                        SessionValue::Any(Any::String(bg)),
+                    ),
+                    (
+                        "prop:emoji".to_string(),
+                        SessionValue::Any(Any::String(icon)),
+                    ),
+                ]);
+            }
+            Self::Table { rows } => {
+                let col_count = rows.iter().map(Vec::len).max().unwrap_or(0);
+                let mut row_entries = Vec::with_capacity(rows.len());
+                let mut col_entries = Vec::with_capacity(col_count);
+                let mut cell_entries = Vec::new();
+                for col_idx in 0..col_count {
+                    let col_id = format!("col-{col_idx}");
+                    let order = format!("a{col_idx}");
+                    col_entries.push((
+                        col_id.clone(),
+                        SessionValue::Map(vec![
+                            (
+                                "columnId".to_string(),
+                                SessionValue::Any(Any::String(col_id)),
+                            ),
+                            ("order".to_string(), SessionValue::Any(Any::String(order))),
+                        ]),
+                    ));
+                }
+                for (row_idx, row) in rows.iter().enumerate() {
+                    let row_id = format!("row-{row_idx}");
+                    let order = format!("a{row_idx}");
+                    row_entries.push((
+                        row_id.clone(),
+                        SessionValue::Map(vec![
+                            (
+                                "rowId".to_string(),
+                                SessionValue::Any(Any::String(row_id.clone())),
+                            ),
+                            ("order".to_string(), SessionValue::Any(Any::String(order))),
+                        ]),
+                    ));
+                    for (col_idx, cell_text) in row.iter().enumerate() {
+                        let key = format!("{row_id}:col-{col_idx}");
+                        cell_entries.push((
+                            key,
+                            SessionValue::Map(vec![("text".to_string(), text_value(cell_text))]),
+                        ));
+                    }
+                }
+                entries.extend([
+                    ("prop:rows".to_string(), SessionValue::Map(row_entries)),
+                    ("prop:columns".to_string(), SessionValue::Map(col_entries)),
+                    ("prop:cells".to_string(), SessionValue::Map(cell_entries)),
+                ]);
+            }
+            Self::Attachment {
+                name,
+                size,
+                mime_type,
+                source_id,
+                caption,
+                embed,
+            } => {
+                entries.extend([
+                    (
+                        "prop:name".to_string(),
+                        SessionValue::Any(Any::String(name)),
+                    ),
+                    (
+                        "prop:size".to_string(),
+                        SessionValue::Any(Any::BigInt64(size)),
+                    ),
+                    (
+                        "prop:type".to_string(),
+                        SessionValue::Any(Any::String(mime_type)),
+                    ),
+                    (
+                        "prop:sourceId".to_string(),
+                        SessionValue::Any(Any::String(source_id)),
+                    ),
+                    (
+                        "prop:caption".to_string(),
+                        SessionValue::Any(if caption.is_empty() {
+                            Any::Null
+                        } else {
+                            Any::String(caption)
+                        }),
+                    ),
+                    (
+                        "prop:embed".to_string(),
+                        SessionValue::Any(if embed { Any::True } else { Any::False }),
+                    ),
+                    (
+                        "prop:style".to_string(),
+                        SessionValue::Any(Any::String("horizontalThin".to_string())),
+                    ),
+                    (
+                        "prop:index".to_string(),
+                        SessionValue::Any(Any::String("a0".to_string())),
+                    ),
+                    (
+                        "prop:xywh".to_string(),
+                        SessionValue::Any(Any::String("[0,0,0,0]".to_string())),
+                    ),
+                    (
+                        "prop:lockedBySelf".to_string(),
+                        SessionValue::Any(Any::False),
+                    ),
+                    (
+                        "prop:rotate".to_string(),
+                        SessionValue::Any(Any::Integer(0)),
+                    ),
+                    (
+                        "prop:footnoteIdentifier".to_string(),
+                        SessionValue::Any(Any::Null),
+                    ),
+                ]);
+            }
+            Self::EmbedLinkedDoc {
+                page_id,
+                style,
+                caption,
+            } => {
+                entries.extend([
+                    (
+                        "prop:pageId".to_string(),
+                        SessionValue::Any(Any::String(page_id)),
+                    ),
+                    (
+                        "prop:style".to_string(),
+                        SessionValue::Any(Any::String(style)),
+                    ),
+                    (
+                        "prop:caption".to_string(),
+                        SessionValue::Any(if caption.is_empty() {
+                            Any::Null
+                        } else {
+                            Any::String(caption)
+                        }),
+                    ),
+                    (
+                        "prop:index".to_string(),
+                        SessionValue::Any(Any::String("a0".to_string())),
+                    ),
+                    (
+                        "prop:xywh".to_string(),
+                        SessionValue::Any(Any::String("[0,0,0,0]".to_string())),
+                    ),
+                    (
+                        "prop:lockedBySelf".to_string(),
+                        SessionValue::Any(Any::False),
+                    ),
+                    (
+                        "prop:rotate".to_string(),
+                        SessionValue::Any(Any::Integer(0)),
+                    ),
+                ]);
+            }
+            Self::EmbedSyncedDoc { page_id, caption } => {
+                entries.extend([
+                    (
+                        "prop:pageId".to_string(),
+                        SessionValue::Any(Any::String(page_id)),
+                    ),
+                    (
+                        "prop:style".to_string(),
+                        SessionValue::Any(Any::String("syncedDoc".to_string())),
+                    ),
+                    (
+                        "prop:caption".to_string(),
+                        SessionValue::Any(if caption.is_empty() {
+                            Any::Null
+                        } else {
+                            Any::String(caption)
+                        }),
+                    ),
+                    ("prop:scale".to_string(), SessionValue::Any(Any::Integer(1))),
+                    (
+                        "prop:index".to_string(),
+                        SessionValue::Any(Any::String("a0".to_string())),
+                    ),
+                    (
+                        "prop:xywh".to_string(),
+                        SessionValue::Any(Any::String("[0,0,0,0]".to_string())),
+                    ),
+                    (
+                        "prop:lockedBySelf".to_string(),
+                        SessionValue::Any(Any::False),
+                    ),
+                    (
+                        "prop:rotate".to_string(),
+                        SessionValue::Any(Any::Integer(0)),
+                    ),
+                ]);
+            }
+            Self::SurfaceRef {
+                reference,
+                ref_flavour,
+                caption,
+            } => {
+                entries.extend([
+                    (
+                        "prop:reference".to_string(),
+                        SessionValue::Any(Any::String(reference)),
+                    ),
+                    (
+                        "prop:refFlavour".to_string(),
+                        SessionValue::Any(Any::String(ref_flavour)),
+                    ),
+                    (
+                        "prop:caption".to_string(),
+                        SessionValue::Any(if caption.is_empty() {
+                            Any::Null
+                        } else {
+                            Any::String(caption)
+                        }),
+                    ),
+                    (
+                        "prop:index".to_string(),
+                        SessionValue::Any(Any::String("a0".to_string())),
+                    ),
+                    (
+                        "prop:xywh".to_string(),
+                        SessionValue::Any(Any::String("[0,0,0,0]".to_string())),
+                    ),
+                    (
+                        "prop:lockedBySelf".to_string(),
+                        SessionValue::Any(Any::False),
+                    ),
+                    (
+                        "prop:rotate".to_string(),
+                        SessionValue::Any(Any::Integer(0)),
                     ),
                 ]);
             }
