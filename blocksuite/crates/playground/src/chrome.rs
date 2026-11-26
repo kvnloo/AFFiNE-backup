@@ -590,6 +590,7 @@ impl ui::Render for PlaygroundView {
         self.overlays.set_keyboard_toolbar_marks_disabled(
             self.table_cell.is_some() && self.editor.selection.is_none(),
         );
+        self.sync_keyboard_toolbar_state();
         window.set_touch_gestures_enabled(true);
         for gesture in window.take_touch_gestures() {
             if self.mode == PlaygroundMode::Page

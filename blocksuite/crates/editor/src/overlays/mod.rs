@@ -31,12 +31,17 @@ mod toolbar;
 
 pub use equation::{EquationEditor, EquationTarget};
 pub use keyboard_toolbar::{
+    DEFAULT_KEYBOARD_TOOLBAR_ITEMS, HighlightColor, KEYBOARD_TOOL_PANEL_HEIGHT,
     KEYBOARD_TOOLBAR_BUTTON, KEYBOARD_TOOLBAR_HEIGHT, KeyboardToolbarAction,
+    KeyboardToolbarCapabilities, KeyboardToolbarDateKind, KeyboardToolbarLevel,
+    KeyboardToolbarPanel, KeyboardToolbarState, MORE_TOOL_PANEL_GROUPS, TEXT_SUB_TOOLBAR_ITEMS,
+    TURN_INTO_PANEL_ITEMS, ToolPanelGroupSpec, ToolbarActionSpec, ToolbarItemSpec,
+    is_flavour_supported,
 };
 pub use paint_page::{block_text, bounding_rect, find_parent, shared_alignment};
 pub use slash::{
-    SLASH_ITEMS, SlashCommand, SlashItem, SlashMenu, SlashRow, filter_slash_items, slash_rows,
-    slash_rows_for_query,
+    SLASH_ITEMS, SlashCommand, SlashItem, SlashMenu, SlashRow, filter_slash_items,
+    slash_item_by_id, slash_rows, slash_rows_for_query,
 };
 pub use state::normalize_url;
 pub use table_cell::InlineTableCell;
@@ -595,9 +600,7 @@ pub struct Overlays {
     pub(super) copied_generation: u64,
     pub(super) linked_doc: Option<LinkedDocMenuState>,
     pub(super) equation: Option<EquationEditor>,
-    pub(super) keyboard_toolbar_visible: bool,
-    pub(super) keyboard_toolbar_page: usize,
-    pub(super) keyboard_toolbar_marks_disabled: bool,
+    pub(super) keyboard_toolbar: KeyboardToolbarState,
     pub format_cache: Option<FormatCache>,
 }
 
@@ -762,6 +765,7 @@ impl Overlays {
         self.chevrons.clear();
         self.linked_doc = None;
         self.equation = None;
+        self.keyboard_toolbar.close_transient();
         self.format_cache = None;
     }
 }
