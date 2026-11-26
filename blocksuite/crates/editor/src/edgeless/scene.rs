@@ -150,6 +150,8 @@ pub fn prepare_edgeless_scene(
                                 page_titles: input.page_titles,
                                 images: input.images,
                                 pdf_previews: None,
+                                doc_directory: None,
+                                equation_draft: None,
                                 env_rev: input.env_rev,
                                 direction: input.direction,
                             };
@@ -243,6 +245,8 @@ pub fn prepare_edgeless_scene(
                                     page_titles: input.page_titles,
                                     images: input.images,
                                     pdf_previews: None,
+                                    doc_directory: None,
+                                    equation_draft: None,
                                     env_rev: input.env_rev,
                                     direction: input.direction,
                                 };

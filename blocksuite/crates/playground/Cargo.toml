@@ -15,7 +15,6 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = []
 harness = ["ui/harness", "blocksuite-editor/harness"]
-preview-engine = ["blocksuite-editor/preview-engine"]
 
 [[bin]]
 name = "native-playground"

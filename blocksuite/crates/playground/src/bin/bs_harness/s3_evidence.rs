@@ -102,9 +102,67 @@ fn new_doc_state(title: &str) -> Result<DocState> {
     state
         .workspace
         .create_page("doc:roadmap", "Mobile Rust Roadmap 2026", 2)?;
+    {
+        let roadmap = state.workspace.ensure_page("doc:roadmap")?;
+        roadmap.add_block(
+            "rm-root",
+            BlockSpec::Page {
+                title: "Mobile Rust Roadmap 2026".into(),
+            },
+            None,
+            None,
+            1,
+        )?;
+        roadmap.add_block(
+            "rm-note",
+            BlockSpec::Note { xywh: None },
+            Some("rm-root"),
+            None,
+            2,
+        )?;
+        roadmap.add_block(
+            "rm-p1",
+            BlockSpec::Paragraph {
+                paragraph_type: ParagraphType::Text,
+                text: "Pure-Rust cross-platform BlockSuite editor targeting iOS, Android, and Web with 1:1 visual parity.".into(),
+            },
+            Some("rm-note"),
+            None,
+            3,
+        )?;
+    }
     state
         .workspace
         .create_page("doc:synced-spec", "Synced Design Tokens", 3)?;
+    {
+        let synced = state.workspace.ensure_page("doc:synced-spec")?;
+        synced.add_block(
+            "sy-root",
+            BlockSpec::Page {
+                title: "Synced Design Tokens".into(),
+            },
+            None,
+            None,
+            1,
+        )?;
+        synced.add_block(
+            "sy-note",
+            BlockSpec::Note { xywh: None },
+            Some("sy-root"),
+            None,
+            2,
+        )?;
+        synced.add_block(
+            "sy-p1",
+            BlockSpec::Paragraph {
+                paragraph_type: ParagraphType::Text,
+                text: "Semantic tokens are generated from packages/ui/tokens and shared across Light and Dark themes.".into(),
+            },
+            Some("sy-note"),
+            None,
+            3,
+        )?;
+    }
     let page = state.workspace.ensure_page(HOME_PAGE_ID)?;
     page.add_block(
         "p-root",
@@ -368,27 +426,20 @@ pub(super) fn render_s3_evidence(out_dir: &Path) -> Result<()> {
             &out_dir.join("03a-pdf-page-1.png"),
             "03a-pdf-page-1",
         )?;
-        if let Ok((nx, ny)) = element_center(&snap_p1, "page.block.b-pdf.pdf_next") {
-            session.headless_win.simulate_click(point(px(nx), px(ny)));
-            session.settle(200);
-            let page_idx = session.view(|v, _| v.attachment_pdf_page_index("b-pdf"))?;
-            anyhow::ensure!(
-                page_idx == Some(1),
-                "expected PDF page index 1, got {page_idx:?}"
-            );
-            save_session_png(
-                &session,
-                &out_dir.join("03-pdf-attachment-page-2.png"),
-                "03-pdf-attachment-page-2",
-            )?;
-        } else {
-            // Default build without `preview-engine`: renders honest attachment file card.
-            save_session_png(
-                &session,
-                &out_dir.join("03-pdf-attachment-fallback-card.png"),
-                "03-pdf-attachment-fallback-card",
-            )?;
-        }
+        let (nx, ny) = element_center(&snap_p1, "page.block.b-pdf.pdf_next")
+            .context("expected live Hayro PDF page controls on native")?;
+        session.headless_win.simulate_click(point(px(nx), px(ny)));
+        session.settle(200);
+        let page_idx = session.view(|v, _| v.attachment_pdf_page_index("b-pdf"))?;
+        anyhow::ensure!(
+            page_idx == Some(1),
+            "expected PDF page index 1, got {page_idx:?}"
+        );
+        save_session_png(
+            &session,
+            &out_dir.join("03-pdf-attachment-page-2.png"),
+            "03-pdf-attachment-page-2",
+        )?;
     }
 
     // 4. Mobile 390x844 narrow viewport: KeyboardToolbar (44x44pt) + @ exact-substring

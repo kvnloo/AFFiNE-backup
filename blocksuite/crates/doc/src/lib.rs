@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod awareness;
+pub mod crdt_v1;
 pub mod fractional_index;
 pub mod read;
 pub mod refs;

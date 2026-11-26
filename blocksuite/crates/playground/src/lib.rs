@@ -10,11 +10,16 @@ pub use blocksuite_editor::{
 mod chrome;
 pub mod edgeless;
 pub mod editor_session;
+mod layout_cache;
 pub mod overlays;
 pub mod room_client;
 
 mod showcase;
 mod view_room;
+#[cfg(target_family = "wasm")]
+pub mod wasm_crdt;
+#[cfg(target_family = "wasm")]
+mod wasm_preview;
 
 pub use showcase::seed_showcase_doc;
 #[cfg(target_arch = "wasm32")]
@@ -32,12 +37,12 @@ use blocksuite_playground_doc::{
     awareness::{AwarenessPayload, TextRangePoint, TextSelectionState},
     read::{BlockContent, PageSnapshot},
 };
-use ui::{Motion, MotionCurve, ScrollEvent, Task, Window, point, prelude::*, px, size};
+use ui::{Motion, ScrollEvent, Task, Window, point, prelude::*, px, size};
 
 use crate::{
-    block_flow::{BlockFlow, FlowInput, FlowLayout, ImageSlot, decode_image, page_geometry},
+    block_flow::{BlockFlow, FlowLayout, ImageSlot, page_geometry},
     overlays::Overlays,
-    room_client::{DocState, RoomCommand, RoomConfig, RoomProtocol},
+    room_client::{DocState, RoomConfig, RoomProtocol},
 };
 
 pub use crate::theme::PlaygroundTheme;
@@ -150,9 +155,9 @@ pub(crate) const PILL_EDGELESS_X: f64 = 94.0;
 pub(crate) const PILL_TRANSITION_MS: f64 = 200.0;
 pub(crate) const THEME_TOGGLE_SIZE: f32 = 32.0;
 pub(crate) const TOPBAR_EDGE: f32 = 12.0;
-const SCROLL_LINE: f32 = 20.0;
+pub(crate) const SCROLL_LINE: f32 = 20.0;
 
-type LayoutKey = (u64, u32, PlaygroundTheme, u64, bool);
+type LayoutKey = (u64, u32, PlaygroundTheme, u64, u64, u64, bool);
 
 /// Interactive GPUI root view for desktop, Web canvas, and headless verification sessions.
 pub struct PlaygroundView {
@@ -549,251 +554,6 @@ impl PlaygroundView {
     pub fn scroll_offset(&self) -> f32 {
         self.scroll_y
     }
-    pub(crate) fn capture_reading_anchor(&mut self) {
-        if self.reading_anchor.is_none() && self.scroll_y > 0.0 {
-            self.reading_anchor = self.flow_layout().and_then(|layout| {
-                layout
-                    .blocks
-                    .iter()
-                    .find(|block| block.rect().bottom() > self.scroll_y)
-                    .map(|block| (block.block_id.clone(), block.y - self.scroll_y))
-            });
-        }
-    }
-
-    /// Re-read the shown page from the workspace and bring images in line with the blobs.
-    pub(crate) fn refresh_document(&mut self) {
-        self.dirty_text = None;
-        if let Ok(pages) = self.state.workspace.list_pages() {
-            let titles: BTreeMap<String, String> = pages
-                .iter()
-                .map(|page| (page.id.clone(), page.title.clone()))
-                .collect();
-            if titles != self.page_titles {
-                self.page_titles = titles;
-                self.env_rev += 1;
-            }
-            if self.custom_doc_directory.is_none() {
-                let mode = match self.mode {
-                    PlaygroundMode::Page => directory::EditorDocMode::Page,
-                    PlaygroundMode::Edgeless => directory::EditorDocMode::Edgeless,
-                };
-                let docs = pages.iter().map(|page| directory::EditorDocSummary {
-                    id: directory::EditorDocId::new(&page.id),
-                    title: page.title.clone(),
-                    mode,
-                    updated_at_ms: 0,
-                });
-                self.default_doc_directory.retain_and_upsert_docs(docs);
-            }
-
-            self.page_id = pages
-                .iter()
-                .find(|page| page.id == HOME_PAGE_ID)
-                .or(pages.first())
-                .map(|page| page.id.clone());
-        } else if self
-            .page_id
-            .as_deref()
-            .is_some_and(|id| self.state.workspace.page(id).is_none())
-        {
-            self.page_id = None;
-        }
-        self.snapshot = self
-            .page_id
-            .as_deref()
-            .and_then(|id| self.state.workspace.page(id))
-            .and_then(|page| page.read_page_snapshot().ok())
-            .filter(|snapshot| snapshot.root.is_some())
-            .map(Rc::new);
-        self.doc_rev += 1;
-        self.edgeless_refresh_label_editor_from_snapshot();
-        self.sync_table_cell_from_snapshot();
-
-        let mut referenced = BTreeSet::new();
-        let mut pdf_attachments: Vec<(String, String)> = Vec::new();
-        for node in self
-            .snapshot
-            .iter()
-            .flat_map(|snapshot| snapshot.root.iter())
-            .flat_map(|root| root.walk())
-        {
-            match &node.content {
-                BlockContent::Image { source_id, .. } if !source_id.is_empty() => {
-                    referenced.insert(source_id.clone());
-                }
-                BlockContent::Attachment {
-                    name,
-                    mime_type,
-                    source_id,
-                    embed,
-                    ..
-                } if !source_id.is_empty() => {
-                    referenced.insert(source_id.clone());
-                    if *embed
-                        && (mime_type.eq_ignore_ascii_case("application/pdf")
-                            || name.to_ascii_lowercase().ends_with(".pdf"))
-                    {
-                        pdf_attachments.push((node.id.clone(), source_id.clone()));
-                    }
-                }
-                _ => {}
-            }
-        }
-        self.refresh_pdf_previews(&pdf_attachments);
-        // Fetches of blobs the page no longer references stop. An ordinary document
-        // update never restarts a fetch that is already tracked.
-        let images = &mut self.images;
-        self.blob_fetches.retain(|source_id, _| {
-            let keep = referenced.contains(source_id);
-            if !keep {
-                images.remove(source_id);
-            }
-            keep
-        });
-        for source_id in referenced {
-            if let Some(bytes) = self.state.blobs.get(&source_id) {
-                // Decoded once; a blob that is no image stays unavailable.
-                if !self.images.contains_key(&source_id)
-                    || self.blob_fetches.remove(&source_id).is_some()
-                {
-                    let slot = decode_image(bytes).map_or(ImageSlot::Unavailable, ImageSlot::Ready);
-                    self.images.insert(source_id, slot);
-                    self.env_rev += 1;
-                }
-            } else if let Some(room) = &self.room
-                && !self.blob_fetches.contains_key(&source_id)
-            {
-                self.blob_fetches.insert(
-                    source_id.clone(),
-                    BlobFetchState {
-                        in_flight: true,
-                        ..BlobFetchState::default()
-                    },
-                );
-                room.link.send(RoomCommand::FetchBlob(source_id));
-            }
-        }
-    }
-
-    pub(crate) fn target_pill_x(mode: PlaygroundMode) -> f64 {
-        match mode {
-            PlaygroundMode::Page => PILL_PAGE_X,
-            PlaygroundMode::Edgeless => PILL_EDGELESS_X,
-        }
-    }
-
-    pub(crate) fn indicator_x(&self, now_ms: f64) -> f64 {
-        match self.pill_motion {
-            Some(motion) => motion.value_at(now_ms),
-            None => Self::target_pill_x(self.mode),
-        }
-    }
-
-    pub(crate) fn set_mode(
-        &mut self,
-        target: PlaygroundMode,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.mode == target {
-            return;
-        }
-        let now_ms = self.now_ms(cx);
-        let current_x = self.indicator_x(now_ms);
-        // Commit any pending inline edit (table cell or Edgeless label) cleanly before switching modes.
-        self.finish_inline_targets(
-            overlays::InlineTargetEnd::CommitPreedit,
-            Some(window),
-            Some(cx),
-        );
-        if self.edgeless.authoring.editing_spatial_block().is_some() {
-            self.edgeless.authoring.inline_edit = None;
-            self.editor.clear_preedit_state();
-            self.editor.selection = None;
-            self.announce_selection(cx);
-        }
-        self.edgeless.authoring.reset_transient();
-        self.mode = target;
-        self.overlays.reset();
-        self.pill_motion = Some(Motion::new(
-            current_x,
-            Self::target_pill_x(target),
-            MotionCurve::EaseInOutCubic,
-            now_ms,
-            PILL_TRANSITION_MS,
-        ));
-        cx.notify();
-    }
-
-    pub(crate) fn on_scroll(
-        &mut self,
-        event: &ScrollEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let delta = event.delta.pixel_delta(px(SCROLL_LINE));
-        // A sideways scroll over an unwrapped code block scrolls its lines, not the page.
-        if let Some((snapshot, layout)) = self.snapshot.clone().zip(self.flow_layout()) {
-            let scene = self.overlay_scene(&snapshot, &layout, window.layout_direction(), None);
-            if self.overlays.scroll_code(
-                &scene,
-                f32::from(event.position.x),
-                f32::from(event.position.y),
-                f32::from(delta.x),
-                f32::from(delta.y),
-            ) {
-                cx.notify();
-                return;
-            }
-        }
-        let delta = f32::from(delta.y);
-        let target = (self.scroll_y - delta).clamp(0.0, self.max_scroll).round();
-        if target != self.scroll_y {
-            self.scroll_y = target;
-            cx.notify();
-        }
-    }
-
-    pub(crate) fn ensure_layout(&mut self, width: f32, window: &Window) -> Option<Rc<FlowLayout>> {
-        let snapshot = self.snapshot.clone()?;
-        let is_rtl = window.layout_direction().is_rtl();
-        let key = (
-            self.doc_rev,
-            width.to_bits(),
-            self.theme,
-            self.env_rev,
-            is_rtl,
-        );
-        if let Some((cached, layout)) = &self.layout
-            && *cached == key
-        {
-            return Some(layout.clone());
-        }
-        let snapshot = self.preedit_snapshot().map(Rc::new).unwrap_or(snapshot);
-        let dirty = self.dirty_text.take().filter(|_| {
-            self.layout.as_ref().is_some_and(|(old, _)| {
-                old.1 == key.1 && old.2 == key.2 && old.3 == key.3 && old.4 == key.4
-            })
-        });
-        let layout = Rc::new(self.flow.layout_changed(
-            &FlowInput {
-                snapshot: &snapshot,
-                width,
-                theme: self.theme,
-                page_titles: &self.page_titles,
-                images: &self.images,
-                pdf_previews: Some(&self.pdf_previews),
-                env_rev: self.env_rev,
-                direction: window.layout_direction(),
-            },
-            window,
-            dirty.as_ref(),
-        ));
-        self.dirty_text = Some(BTreeSet::new());
-        self.layout = Some((key, layout.clone()));
-        Some(layout)
-    }
 }
 
 #[cfg(test)]
@@ -813,9 +573,9 @@ mod tests {
         block_flow::{
             BOOKMARK_HEIGHT, CHILD_INDENT, CODE_PADDING, CODE_RADIUS, DIVIDER_HEIGHT, FlowKind,
             FlowTextLayout, LIST_PREFIX_WIDTH, QUOTE_BAR_WIDTH, QUOTE_PADDING, TITLE_PADDING_Y,
-            TITLE_SPEC, paragraph_spec,
+            TITLE_SPEC, decode_image, paragraph_spec,
         },
-        room_client::RoomFrame,
+        room_client::{RoomCommand, RoomFrame},
         theme::{TYPOGRAPHY, tokens},
     };
     use crate::{
@@ -8694,7 +8454,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "preview-engine")]
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn set_document_reloads_pdf_preview_and_source_id_change_invalidates_stale_texture() {
         fn minimal_pdf() -> Vec<u8> {
@@ -8979,7 +8739,7 @@ mod tests {
         );
     }
 
-    #[cfg(not(feature = "preview-engine"))]
+    #[cfg(target_arch = "wasm32")]
     #[test]
     fn default_build_uses_registered_pdf_page_provider_and_falls_back_when_absent() {
         use std::sync::Mutex;
@@ -9827,5 +9587,440 @@ mod tests {
                 "caret must sit at clicked offset before 2, got {sel:?}"
             );
         }
+    }
+
+    #[test]
+    fn s3_4a_equation_multiline_live_preview_and_zero_writeback_cancel() {
+        let mut state = DocState::new("eq-live", 101).unwrap();
+        state
+            .workspace
+            .create_page(HOME_PAGE_ID, "EqLive", 1)
+            .unwrap();
+        {
+            let page = state.workspace.ensure_page(HOME_PAGE_ID).unwrap();
+            page.add_block(
+                "root",
+                BlockSpec::Page {
+                    title: "EqLive".into(),
+                },
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+            page.add_block(
+                "note",
+                BlockSpec::Note { xywh: None },
+                Some("root"),
+                None,
+                2,
+            )
+            .unwrap();
+            page.add_block(
+                "b-eq",
+                BlockSpec::Latex {
+                    latex: r"x^2".into(),
+                },
+                Some("note"),
+                None,
+                3,
+            )
+            .unwrap();
+            page.stop_capturing().unwrap();
+        }
+        let session = open(1280, 800, PlaygroundOptions::default());
+        session.view(|v, cx| v.set_document(state, cx));
+        let _ = session.frame();
+        let before_update = session.view(|v, _| {
+            v.state
+                .workspace
+                .page(HOME_PAGE_ID)
+                .unwrap()
+                .encode_update_v1()
+                .unwrap()
+        });
+
+        // Open equation editor on b-eq and insert a newline via Shift+Enter plus new LaTeX.
+        session.app.update(|cx| {
+            session
+                .window
+                .update(cx, |v, w, cx| {
+                    v.dispatch_overlay(
+                        crate::overlays::OverlayEvent::OpenEquationEditor {
+                            target: crate::overlays::EquationTarget::Block {
+                                block_id: "b-eq".into(),
+                            },
+                            initial: r"x^2".into(),
+                        },
+                        w,
+                        cx,
+                    );
+                })
+                .unwrap();
+        });
+        let _ = session.frame();
+
+        // Type Shift+Enter and "+ 1", then mark IME preedit "ni" (must not leak into draft preview).
+        session.app.update(|cx| {
+            session
+                .window
+                .update(cx, |v, w, cx| {
+                    let key = ui::KeyDownEvent {
+                        keystroke: ui::Keystroke::parse("shift-enter").unwrap(),
+                        is_held: false,
+                        prefer_character_input: false,
+                    };
+                    v.editor_key_down(&key, w, cx);
+                    ui::EntityInputHandler::replace_text_in_range(v, None, "+ 1", w, cx);
+                    ui::EntityInputHandler::replace_and_mark_text_in_range(
+                        v, None, "ni", None, w, cx,
+                    );
+                })
+                .unwrap();
+        });
+        let _ = session.frame();
+
+        // Live preview reflects committed draft ("x^2\n+ 1") excluding IME preedit ("ni"),
+        // while CRDT document still holds original "x^2" with zero writeback!
+        let (crdt_latex, draft_committed) = session.view(|v, _| {
+            let page = v.state.workspace.page(HOME_PAGE_ID).unwrap();
+            let snap = page.read_page_snapshot().unwrap();
+            let eq = snap
+                .root
+                .as_ref()
+                .unwrap()
+                .walk()
+                .find(|n| n.id == "b-eq")
+                .map(|n| match &n.content {
+                    BlockContent::Latex { latex, .. } => latex.clone(),
+                    _ => String::new(),
+                })
+                .unwrap_or_default();
+            let draft = v
+                .overlays
+                .equation_editor()
+                .map(|e| e.committed_draft().to_string())
+                .unwrap_or_default();
+            (eq, draft)
+        });
+        assert_eq!(
+            crdt_latex, "x^2",
+            "draft editing must perform zero CRDT writeback"
+        );
+        assert_eq!(
+            draft_committed, "x^2\n+ 1",
+            "committed draft must include Shift+Enter newline and exclude IME preedit"
+        );
+
+        // Escape cancels with zero CRDT writeback and zero undo pollution.
+        session.app.update(|cx| {
+            session
+                .window
+                .update(cx, |v, w, cx| {
+                    let esc = ui::KeyDownEvent {
+                        keystroke: ui::Keystroke::parse("escape").unwrap(),
+                        is_held: false,
+                        prefer_character_input: false,
+                    };
+                    v.editor_key_down(&esc, w, cx);
+                    // Second Escape closes editor after abandoning preedit.
+                    v.editor_key_down(&esc, w, cx);
+                })
+                .unwrap();
+        });
+        let _ = session.frame();
+        let (after_cancel, after_update) = session.view(|v, _| {
+            let page = v.state.workspace.page(HOME_PAGE_ID).unwrap();
+            let snap = page.read_page_snapshot().unwrap();
+            let eq = snap
+                .root
+                .as_ref()
+                .unwrap()
+                .walk()
+                .find(|n| n.id == "b-eq")
+                .map(|n| match &n.content {
+                    BlockContent::Latex { latex, .. } => latex.clone(),
+                    _ => String::new(),
+                })
+                .unwrap_or_default();
+            (eq, page.encode_update_v1().unwrap())
+        });
+        assert_eq!(after_cancel, "x^2");
+        assert_eq!(
+            after_update, before_update,
+            "cancelling equation editor must leave CRDT bytes and undo history untouched"
+        );
+    }
+
+    #[test]
+    fn s3_4a_callout_horizontal_row_and_embeds_zero_internal_ids() {
+        let mut state = DocState::new("p4-p6", 102).unwrap();
+        state
+            .workspace
+            .create_page(HOME_PAGE_ID, "RichParity", 1)
+            .unwrap();
+        state
+            .workspace
+            .create_page("doc:roadmap", "Roadmap 2026", 2)
+            .unwrap();
+        state
+            .workspace
+            .create_page("doc:synced", "Synced Spec", 3)
+            .unwrap();
+        {
+            let synced = state.workspace.ensure_page("doc:synced").unwrap();
+            synced
+                .add_block(
+                    "s-root",
+                    BlockSpec::Page {
+                        title: "Synced Spec".into(),
+                    },
+                    None,
+                    None,
+                    1,
+                )
+                .unwrap();
+            synced
+                .add_block(
+                    "s-note",
+                    BlockSpec::Note { xywh: None },
+                    Some("s-root"),
+                    None,
+                    2,
+                )
+                .unwrap();
+            synced
+                .add_block(
+                    "s-p",
+                    BlockSpec::Paragraph {
+                        paragraph_type: ParagraphType::Text,
+                        text: "Synced body line".into(),
+                    },
+                    Some("s-note"),
+                    None,
+                    3,
+                )
+                .unwrap();
+        }
+        {
+            let page = state.workspace.ensure_page(HOME_PAGE_ID).unwrap();
+            page.add_block(
+                "root",
+                BlockSpec::Page {
+                    title: "RichParity".into(),
+                },
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+            page.add_block(
+                "note",
+                BlockSpec::Note { xywh: None },
+                Some("root"),
+                None,
+                2,
+            )
+            .unwrap();
+            page.add_block(
+                "b-callout",
+                BlockSpec::Callout {
+                    icon: "\u{1F4A1}".into(),
+                    background_color: Some("blue".into()),
+                },
+                Some("note"),
+                None,
+                3,
+            )
+            .unwrap();
+            page.add_block(
+                "b-callout-p",
+                BlockSpec::Paragraph {
+                    paragraph_type: ParagraphType::Text,
+                    text: "Same row body".into(),
+                },
+                Some("b-callout"),
+                None,
+                4,
+            )
+            .unwrap();
+            page.add_block(
+                "b-link",
+                BlockSpec::EmbedLinkedDoc {
+                    page_id: "doc:roadmap".into(),
+                    style: "horizontal".into(),
+                    caption: String::new(),
+                },
+                Some("note"),
+                None,
+                5,
+            )
+            .unwrap();
+            page.add_block(
+                "b-sync",
+                BlockSpec::EmbedSyncedDoc {
+                    page_id: "doc:synced".into(),
+                    caption: String::new(),
+                },
+                Some("note"),
+                None,
+                6,
+            )
+            .unwrap();
+            page.add_block(
+                "b-sref",
+                BlockSpec::SurfaceRef {
+                    reference: "frame-overview".into(),
+                    ref_flavour: "affine:frame".into(),
+                    caption: String::new(),
+                },
+                Some("note"),
+                None,
+                7,
+            )
+            .unwrap();
+        }
+        let session = open(1280, 800, PlaygroundOptions::default());
+        session.view(|v, cx| v.set_document(state, cx));
+        let _ = session.frame();
+
+        session.view(|v, _| {
+            let (_, layout) = v.layout.as_ref().expect("layout");
+            let callout = layout
+                .blocks
+                .iter()
+                .find(|b| b.block_id == "b-callout")
+                .expect("callout");
+            let child = layout
+                .blocks
+                .iter()
+                .find(|b| b.block_id == "b-callout-p")
+                .expect("callout child");
+            assert!(
+                (child.rect().y - (callout.rect().y + 5.0)).abs() <= 2.0,
+                "callout child must sit on same row at top+5 (callout.y={}, child.y={})",
+                callout.rect().y,
+                child.rect().y
+            );
+            assert!(
+                (child.rect().x - (callout.rect().x + 44.0)).abs() <= 2.0,
+                "callout child must start at x+44 (callout.x={}, child.x={})",
+                callout.rect().x,
+                child.rect().x
+            );
+            for id in ["b-link", "b-sync", "b-sref"] {
+                let b = layout
+                    .blocks
+                    .iter()
+                    .find(|b| b.block_id == id)
+                    .expect("embed block");
+                for forbidden in ["doc:", "affine:frame", "frame-", "Synced document preview"] {
+                    assert!(
+                        !b.body.plain.contains(forbidden),
+                        "embed block {id} leaked internal identifier '{forbidden}' in plain: {:?}",
+                        b.body.plain
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn s3_4a_wide_table_horizontal_scroll_shifts_hit_test_and_ime_bounds() {
+        let state = make_table_doc_state(
+            "doc:wide-table",
+            "WideTable",
+            vec![
+                (0..8).map(|i| format!("Column Header {i}")).collect(),
+                (0..8)
+                    .map(|i| format!("Cell Value {i} long text"))
+                    .collect(),
+            ],
+            None,
+        );
+        let session = open(640, 800, PlaygroundOptions::default());
+        session.view(|v, cx| v.set_document(state, cx));
+        let _ = session.frame();
+
+        let (has_scroll, max_x, tbl_center) = session.view(|v, _| {
+            let (_, layout) = v.layout.as_ref().expect("layout");
+            let tb = layout
+                .blocks
+                .iter()
+                .find(|b| b.block_id == "tbl")
+                .expect("table block");
+            let r = tb.rect();
+            let cx_pt = r.x + r.w * 0.5;
+            let cy_pt = TOPBAR_HEIGHT + r.y + r.h * 0.5;
+            match &tb.body.code_scroll {
+                Some(s) => (true, s.max_x, (cx_pt, cy_pt)),
+                None => (false, 0.0, (cx_pt, cy_pt)),
+            }
+        });
+        assert!(
+            has_scroll && max_x > 100.0,
+            "wide 8-column table must enable horizontal scroll (max_x={max_x})"
+        );
+
+        // Focus a cell, measure IME bounds at scroll_x=0, then scroll horizontally and confirm bounds shift by -scroll_x.
+        session.app.update(|cx| {
+            session
+                .window
+                .update(cx, |v, w, cx| {
+                    v.dispatch_overlay(
+                        crate::overlays::OverlayEvent::FocusTableCell {
+                            block_id: "tbl".into(),
+                            row_id: "row-1".into(),
+                            column_id: "col-1".into(),
+                            screen_pos: None,
+                        },
+                        w,
+                        cx,
+                    );
+                })
+                .unwrap();
+        });
+        let _ = session.frame();
+        let bounds_0 = session.app.update(|cx| {
+            session
+                .window
+                .update(cx, |v, w, cx| {
+                    ui::EntityInputHandler::bounds_for_range(v, 0..4, Bounds::default(), w, cx)
+                        .expect("IME bounds at scroll 0")
+                })
+                .unwrap()
+        });
+
+        session.app.update(|cx| {
+            session
+                .window
+                .update(cx, |v, _w, cx| {
+                    let (_, layout) = v.layout.as_ref().expect("layout").clone();
+                    let snapshot = v.page_snapshot().expect("snapshot").clone();
+                    let scene = v.overlay_scene(&snapshot, &layout, ui::Direction::Ltr, None);
+                    assert!(
+                        v.overlays
+                            .scroll_code(&scene, tbl_center.0, tbl_center.1, -80.0, 0.0),
+                        "horizontal scroll over wide table must be consumed"
+                    );
+                    cx.notify();
+                })
+                .unwrap();
+        });
+        let _ = session.frame();
+        let bounds_80 = session.app.update(|cx| {
+            session
+                .window
+                .update(cx, |v, w, cx| {
+                    ui::EntityInputHandler::bounds_for_range(v, 0..4, Bounds::default(), w, cx)
+                        .expect("IME bounds at scroll 80")
+                })
+                .unwrap()
+        });
+        let dx = f32::from(bounds_0.origin.x) - f32::from(bounds_80.origin.x);
+        assert!(
+            (dx - 80.0).abs() <= 1.5,
+            "IME bounds must shift left by scroll_x=80, got dx={dx} (b0={bounds_0:?}, b80={bounds_80:?})"
+        );
     }
 }

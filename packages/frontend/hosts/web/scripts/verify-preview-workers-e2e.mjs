@@ -7,7 +7,6 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Worker as NodeWorker } from 'node:worker_threads';
 
-import { createCrdtWasmClient } from '../src/crdt-wasm-client.js';
 import { createWorkerLoader } from '../src/worker-loader.js';
 
 const WEB_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
@@ -347,28 +346,20 @@ try {
     `blue PDF center pixel mismatch: R=${blueR}, B=${blueB}`
   );
 
-  // 6. CRDT codec Wasm (`crdt-codec.dev-local.wasm`): strict import check, real Yjs v1 extract + merge + corrupt fail.
-  const crdtCodecUrl = loader.resolveCrdtCodecUrl();
+  // 6. Main playground Wasm bundle (`assets/pkg/playground.js`): real Yjs v1 extract + merge + corrupt fail.
+  const mainWasmJsUrl = loader.resolveMainWasmJsUrl();
   assert.ok(
-    crdtCodecUrl && crdtCodecUrl.includes('crdt-codec.dev-local.wasm'),
-    `unexpected crdtCodecUrl: ${crdtCodecUrl}`
+    mainWasmJsUrl && mainWasmJsUrl.includes('/assets/pkg/playground.js'),
+    `unexpected mainWasmJsUrl: ${mainWasmJsUrl}`
   );
-  const crdtWasmBytes = readFileSync(
-    join(ASSETS_DIR, 'crdt-codec.dev-local.wasm')
+  const playgroundWasmBytes = readFileSync(
+    join(ASSETS_DIR, 'pkg', 'playground_bg.wasm')
   );
-  const crdtClient = createCrdtWasmClient(crdtCodecUrl, {
-    fetchImpl: async () => /** @type {Response} */ (
-      /** @type {unknown} */ ({
-        ok: true,
-        status: 200,
-        arrayBuffer: async () =>
-          crdtWasmBytes.buffer.slice(
-            crdtWasmBytes.byteOffset,
-            crdtWasmBytes.byteOffset + crdtWasmBytes.byteLength
-          ),
-      })
-    ),
-  });
+  const playgroundMod = await import(
+    pathToFileURL(join(ASSETS_DIR, 'pkg', 'playground.js')).toString()
+  );
+  playgroundMod.initSync({ module: playgroundWasmBytes });
+
   const realYjsV1 = [
     new Uint8Array([
       1, 6, 105, 0, 39, 1, 4, 109, 101, 116, 97, 5, 112, 97, 103, 101, 115, 0,
@@ -384,22 +375,22 @@ try {
       118, 0, 1, 105, 1, 4, 1,
     ]),
   ];
-  assert.deepEqual(await crdtClient.extractSubdocIds(realYjsV1), ['live-guid']);
-  const mergedV1 = await crdtClient.mergeUpdates(realYjsV1);
+  assert.deepEqual(playgroundMod.extract_subdoc_ids(realYjsV1), ['live-guid']);
+  const mergedV1 = playgroundMod.merge_updates_v1(realYjsV1);
   assert.ok(mergedV1 instanceof Uint8Array && mergedV1.byteLength > 0);
-  assert.deepEqual(await crdtClient.extractSubdocIds([mergedV1]), [
-    'live-guid',
-  ]);
-  const emptyMerged = await crdtClient.mergeUpdates([]);
+  assert.deepEqual(playgroundMod.extract_subdoc_ids([mergedV1]), ['live-guid']);
+  const emptyMerged = playgroundMod.merge_updates_v1([]);
   assert.deepEqual(Array.from(emptyMerged), [0, 0]);
-  await assert.rejects(
+  assert.throws(
     () =>
-      crdtClient.extractSubdocIds([new Uint8Array([0xff, 0xff, 0xff, 0x80])]),
+      playgroundMod.extract_subdoc_ids([
+        new Uint8Array([0xff, 0xff, 0xff, 0x80]),
+      ]),
     /./
   );
 
   console.log(
-    `E2E 4-worker + crdt-codec + static-font verification passed: fonts(${Object.keys(loadedFonts).join(',')}), crdt-codec(${crdtWasmBytes.byteLength}B, merged=${mergedV1.byteLength}B), mermaid(light=${mermaidLight.result.svg.length}B vs dark=${mermaidDark.result.svg.length}B), math(${mathRes.result.svg.length}B), typst(1p ${typstRes.result.svg.length}B), pdf(red R=${redR}/B=${redB}, blue R=${blueR}/B=${blueB}, ${redRes.result.rgba.byteLength}B RGBA)`
+    `E2E 4-worker + main-wasm-crdt + static-font verification passed: fonts(${Object.keys(loadedFonts).join(',')}), playground_bg.wasm(${playgroundWasmBytes.byteLength}B, merged=${mergedV1.byteLength}B), mermaid(light=${mermaidLight.result.svg.length}B vs dark=${mermaidDark.result.svg.length}B), math(${mathRes.result.svg.length}B), typst(1p ${typstRes.result.svg.length}B), pdf(red R=${redR}/B=${redB}, blue R=${blueR}/B=${blueB}, ${redRes.result.rgba.byteLength}B RGBA)`
   );
 } finally {
   await Promise.all(activeWorkers.map(w => w.terminate()));

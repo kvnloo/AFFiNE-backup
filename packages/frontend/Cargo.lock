@@ -101,6 +101,7 @@ name = "affine-store"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "blocksuite-playground-doc",
  "chrono",
  "serde",
  "serde_json",
@@ -109,7 +110,6 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "url",
- "wasm-bindgen",
  "y-octo",
 ]
 

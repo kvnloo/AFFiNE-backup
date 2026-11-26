@@ -473,9 +473,20 @@ impl Overlays {
             match key {
                 "enter" => {
                     if is_equation {
-                        self.apply_equation(now_ms, &mut effects);
+                        if shift {
+                            if let Some(field) = self.active_text_field_mut() {
+                                field.replace(None, "\n");
+                            }
+                        } else {
+                            self.apply_equation(now_ms, &mut effects);
+                        }
                     } else {
                         self.apply_link(false, &mut effects);
+                    }
+                }
+                "up" | "down" if is_equation && !secondary => {
+                    if let Some(editor) = self.equation_editor_mut() {
+                        editor.move_vertical_line(key == "down", shift);
                     }
                 }
                 "escape" => {

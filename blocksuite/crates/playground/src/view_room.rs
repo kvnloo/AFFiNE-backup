@@ -281,6 +281,21 @@ fn web_options() -> PlaygroundOptions {
 #[wasm_bindgen::prelude::wasm_bindgen(start)]
 pub fn wasm_main() {
     console_error_panic_hook::set_once();
+    let Some(window) = web_sys::window() else {
+        // Node / headless Wasm test environment: skip DOM canvas bootstrap so callers can
+        // invoke exported CRDT helpers directly without side effects.
+        return;
+    };
+    if js_sys::Reflect::get(
+        &window,
+        &wasm_bindgen::JsValue::from_str("__AFFINE_WEB_HOST__"),
+    )
+    .ok()
+    .is_some_and(|v| v.is_truthy())
+    {
+        // Web thin host (`/host/`): avoid mounting a second fullscreen playground window.
+        return;
+    }
     let platform = std::rc::Rc::new(ui::WebPlatform::new(false));
     ui::Application::with_platform(platform).run(|cx| {
         if let Err(err) = register_bundled_fonts(cx) {
@@ -288,7 +303,9 @@ pub fn wasm_main() {
         }
         let options = web_options();
         if let Err(err) = cx.open_window(ui::WindowOptions::default(), |_, cx| {
-            cx.new(|cx| PlaygroundView::with_options(options, cx))
+            let view = cx.new(|cx| PlaygroundView::with_options(options, cx));
+            crate::wasm_preview::install_wasm_preview_providers(view.downgrade(), cx);
+            view
         }) {
             panic!("failed to open playground web window: {err:#}");
         }

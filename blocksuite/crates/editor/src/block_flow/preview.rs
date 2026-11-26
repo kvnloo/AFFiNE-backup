@@ -1,18 +1,20 @@
-//! Narrow preview ports (`MathPreviewProvider`, `PdfPageProvider`) and optional
-//! `preview-engine` (`RaTeX` + `Hayro`) bridge for `block_flow`.
+//! Narrow preview ports (`MathPreviewProvider`, `PdfPageProvider`) and pure-Rust
+//! `blocksuite-preview` (`RaTeX` + `Hayro`) integration for `block_flow`.
 //!
-//! When the `preview-engine` Cargo feature is enabled, this module uses in-process
-//! `blocksuite-preview` (`RaTeX` + `Hayro`). When disabled (the default for the main Web
-//! Wasm bundle and default `bs-harness`), callers can inject host/worker-rendered RGBA
-//! frames via `register_math_preview_provider` / `register_pdf_page_provider`, and
-//! `latex_body` renders genuine 2D mathematical notation using `math_layout::layout_math_2d`.
+//! On all non-`wasm32` targets, `blocksuite-preview` (`math` + `pdf`) is compiled in directly.
+//! On `wasm32`, hosts register worker-backed providers via `register_math_preview_provider` /
+//! `register_pdf_page_provider` and bump [`bump_preview_revision`] whenever an async worker
+//! result lands in cache so [`BlockFlow`] invalidates and repaints automatically.
 
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{
+    Arc, OnceLock, RwLock,
+    atomic::{AtomicU64, Ordering},
+};
 
-#[cfg(feature = "preview-engine")]
+#[cfg(not(target_arch = "wasm32"))]
 use std::collections::HashMap;
 
-#[cfg(feature = "preview-engine")]
+#[cfg(not(target_arch = "wasm32"))]
 use blocksuite_preview::{
     FontPool, SvgRasterizer,
     math::{MathDisplayMode, MathRenderOptions, render_latex_rgba},
@@ -21,7 +23,7 @@ use blocksuite_preview::{
 };
 use ui::{Hsla, RenderImage};
 
-#[cfg(feature = "preview-engine")]
+#[cfg(not(target_arch = "wasm32"))]
 use crate::theme::{bundled_font_bytes, bundled_script_font_bytes};
 
 /// Rasterized LaTeX formula ready to paint as a GPUI [`RenderImage`].
@@ -31,6 +33,18 @@ pub struct MathRenderSlot {
     pub width_pt: f32,
     pub ascent_pt: f32,
     pub descent_pt: f32,
+}
+
+/// Three-state outcome of rendering a LaTeX math expression.
+///
+/// Distinguishes genuine syntax/parse errors (`Error` -> red `"Error equation"`) from async
+/// Web Worker computations still in flight or an unconfigured worker (`Pending` -> clean
+/// unframed fallback text, never `"Error equation"`).
+#[derive(Clone)]
+pub enum MathRenderResult {
+    Ready(MathRenderSlot),
+    Pending,
+    Error,
 }
 
 /// Rasterized PDF page preview ready to paint inside an `affine:attachment` block.
@@ -43,8 +57,8 @@ pub struct PdfPreviewPage {
     pub height_pt: f32,
 }
 
-/// Narrow port allowing platform hosts (iOS PDFKit, Android PdfRenderer, Web PDF worker)
-/// or tests to supply rasterized PDF pages without statically linking `hayro`.
+/// Narrow port allowing platform hosts (Web PDF worker, iOS PDFKit, Android PdfRenderer)
+/// or tests to supply rasterized PDF pages.
 pub trait PdfPageProvider: Send + Sync {
     fn page_count(&self, bytes: &[u8]) -> Option<usize>;
     fn render_pdf_page(
@@ -55,8 +69,8 @@ pub trait PdfPageProvider: Send + Sync {
     ) -> Option<PdfPreviewPage>;
 }
 
-/// Narrow port allowing platform hosts (Web math worker, native RaTeX) or tests to supply
-/// rasterized LaTeX math bitmaps without statically linking `ratex-katex-fonts`.
+/// Narrow port allowing platform hosts (Web RaTeX math worker) or tests to supply
+/// rasterized LaTeX math bitmaps.
 pub trait MathPreviewProvider: Send + Sync {
     fn render_math(
         &self,
@@ -64,7 +78,21 @@ pub trait MathPreviewProvider: Send + Sync {
         display: bool,
         font_size_pt: f32,
         color: Hsla,
-    ) -> Option<MathRenderSlot>;
+        dpr: f32,
+    ) -> MathRenderResult;
+}
+
+static PREVIEW_REVISION: AtomicU64 = AtomicU64::new(0);
+
+/// Monotonic revision bumped whenever an asynchronous preview result (math or PDF) lands in
+/// cache. Views include this in their layout cache key and `BlockFlow` fingerprints.
+pub fn preview_revision() -> u64 {
+    PREVIEW_REVISION.load(Ordering::Acquire)
+}
+
+/// Increment [`preview_revision`] after writing a new preview result into a provider cache.
+pub fn bump_preview_revision() -> u64 {
+    PREVIEW_REVISION.fetch_add(1, Ordering::AcqRel) + 1
 }
 
 fn pdf_provider_slot() -> &'static RwLock<Option<Arc<dyn PdfPageProvider>>> {
@@ -82,16 +110,17 @@ pub fn register_pdf_page_provider(provider: Option<Arc<dyn PdfPageProvider>>) {
     if let Ok(mut guard) = pdf_provider_slot().write() {
         *guard = provider;
     }
+    bump_preview_revision();
 }
 
-/// Whether PDF page rasterization is available in this runtime (either via the built-in
-/// `preview-engine` feature or a host-registered [`PdfPageProvider`]).
+/// Whether PDF page rasterization is available in this runtime (built-in Hayro on native
+/// targets or a host-registered [`PdfPageProvider`] on Web).
 pub fn can_render_pdf_pages() -> bool {
-    #[cfg(feature = "preview-engine")]
+    #[cfg(not(target_arch = "wasm32"))]
     {
         true
     }
-    #[cfg(not(feature = "preview-engine"))]
+    #[cfg(target_arch = "wasm32")]
     {
         pdf_provider_slot().read().ok().is_some_and(|g| g.is_some())
     }
@@ -102,33 +131,34 @@ pub fn register_math_preview_provider(provider: Option<Arc<dyn MathPreviewProvid
     if let Ok(mut guard) = math_provider_slot().write() {
         *guard = provider;
     }
+    bump_preview_revision();
 }
 
 /// Parsed PDF handle used to rasterize attachment preview pages on demand.
 pub struct EmbeddedPdfDocument {
-    #[cfg(feature = "preview-engine")]
+    #[cfg(not(target_arch = "wasm32"))]
     renderer: HayroPdfRenderer,
-    #[cfg(not(feature = "preview-engine"))]
+    #[cfg(target_arch = "wasm32")]
     bytes: Vec<u8>,
-    #[cfg(not(feature = "preview-engine"))]
+    #[cfg(target_arch = "wasm32")]
     page_count: usize,
 }
 
 impl EmbeddedPdfDocument {
     /// Total number of pages in this PDF without rasterizing any page.
     pub fn page_count(&self) -> usize {
-        #[cfg(feature = "preview-engine")]
+        #[cfg(not(target_arch = "wasm32"))]
         {
             self.renderer.page_count()
         }
-        #[cfg(not(feature = "preview-engine"))]
+        #[cfg(target_arch = "wasm32")]
         {
             self.page_count
         }
     }
 }
 
-#[cfg(feature = "preview-engine")]
+#[cfg(not(target_arch = "wasm32"))]
 fn shared_font_pool() -> &'static FontPool {
     static POOL: OnceLock<FontPool> = OnceLock::new();
     POOL.get_or_init(|| {
@@ -143,28 +173,39 @@ fn shared_font_pool() -> &'static FontPool {
     })
 }
 
-#[cfg(feature = "preview-engine")]
+#[cfg(not(target_arch = "wasm32"))]
 fn shared_rasterizer() -> &'static SvgRasterizer {
     static RASTER: OnceLock<SvgRasterizer> = OnceLock::new();
     RASTER.get_or_init(|| SvgRasterizer::new(shared_font_pool()))
 }
 
-/// Convert an RGBA8 [`RgbaImageBuffer`] into a GPUI BGRA8 [`RenderImage`].
-#[cfg(feature = "preview-engine")]
-pub fn rgba_buffer_to_render_image(buf: &RgbaImageBuffer) -> Option<Arc<RenderImage>> {
-    if buf.width_px == 0 || buf.height_px == 0 {
+/// Convert raw RGBA8 pixels into a GPUI BGRA8 [`RenderImage`].
+pub fn rgba_pixels_to_render_image(
+    width_px: u32,
+    height_px: u32,
+    rgba: &[u8],
+) -> Option<Arc<RenderImage>> {
+    if width_px == 0
+        || height_px == 0
+        || rgba.len() != (width_px as usize) * (height_px as usize) * 4
+    {
         return None;
     }
-    let mut bgra = buf.pixels.clone();
+    let mut bgra = rgba.to_vec();
     for px in bgra.chunks_exact_mut(4) {
         ui::swap_rgba_pa_to_bgra(px);
     }
-    let img = image::RgbaImage::from_raw(buf.width_px, buf.height_px, bgra)?;
+    let img = image::RgbaImage::from_raw(width_px, height_px, bgra)?;
     Some(Arc::new(RenderImage::new(vec![image::Frame::new(img)])))
 }
 
-#[cfg(feature = "preview-engine")]
-fn hsla_to_css_hex(color: Hsla) -> String {
+/// Convert an RGBA8 [`RgbaImageBuffer`] into a GPUI BGRA8 [`RenderImage`].
+#[cfg(not(target_arch = "wasm32"))]
+pub fn rgba_buffer_to_render_image(buf: &RgbaImageBuffer) -> Option<Arc<RenderImage>> {
+    rgba_pixels_to_render_image(buf.width_px, buf.height_px, &buf.pixels)
+}
+
+pub fn hsla_to_css_hex(color: Hsla) -> String {
     let rgba: ui::Rgba = color.into();
     let r = (rgba.r.clamp(0.0, 1.0) * 255.0).round() as u8;
     let g = (rgba.g.clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -172,29 +213,34 @@ fn hsla_to_css_hex(color: Hsla) -> String {
     format!("#{r:02x}{g:02x}{b:02x}")
 }
 
-#[cfg(feature = "preview-engine")]
-type MathCacheKey = (String, bool, u32, String);
+#[cfg(not(target_arch = "wasm32"))]
+type MathCacheKey = (String, bool, u32, String, u32);
 
 /// Render and cache a LaTeX math expression through any registered [`MathPreviewProvider`]
-/// or (when `preview-engine` is enabled) through pure-Rust RaTeX outlines.
+/// or (on non-`wasm32` targets) through pure-Rust RaTeX outlines.
 pub fn render_math_cached(
     latex: &str,
     display: bool,
     font_size_pt: f32,
     color: Hsla,
-) -> Option<MathRenderSlot> {
+    dpr: f32,
+) -> MathRenderResult {
     let trimmed = latex.trim();
     if trimmed.is_empty() {
-        return None;
+        return MathRenderResult::Pending;
     }
+    let norm_dpr = if dpr.is_finite() && dpr > 0.0 {
+        dpr.clamp(1.0, 4.0)
+    } else {
+        2.0
+    };
     if let Ok(guard) = math_provider_slot().read()
         && let Some(provider) = guard.as_ref()
-        && let Some(slot) = provider.render_math(trimmed, display, font_size_pt, color)
     {
-        return Some(slot);
+        return provider.render_math(trimmed, display, font_size_pt, color, norm_dpr);
     }
 
-    #[cfg(feature = "preview-engine")]
+    #[cfg(not(target_arch = "wasm32"))]
     {
         let color_css = hsla_to_css_hex(color);
         let key = (
@@ -202,9 +248,9 @@ pub fn render_math_cached(
             display,
             font_size_pt.to_bits(),
             color_css.clone(),
+            norm_dpr.to_bits(),
         );
-        static CACHE: OnceLock<RwLock<HashMap<MathCacheKey, Option<MathRenderSlot>>>> =
-            OnceLock::new();
+        static CACHE: OnceLock<RwLock<HashMap<MathCacheKey, MathRenderResult>>> = OnceLock::new();
         let cache = CACHE.get_or_init(|| RwLock::new(HashMap::new()));
         if let Ok(guard) = cache.read()
             && let Some(hit) = guard.get(&key)
@@ -222,23 +268,24 @@ pub fn render_math_cached(
             padding_pt: if display { 4.0 } else { 1.5 },
             color_css,
         };
-        let rendered = render_latex_rgba(
+        let rendered = match render_latex_rgba(
             trimmed,
             &options,
             shared_font_pool(),
             shared_rasterizer(),
-            2.0,
-        )
-        .ok()
-        .and_then(|out| {
-            let image = rgba_buffer_to_render_image(&out.image)?;
-            Some(MathRenderSlot {
-                image,
-                width_pt: out.width_pt as f32,
-                ascent_pt: out.ascent_pt as f32,
-                descent_pt: out.descent_pt as f32,
-            })
-        });
+            norm_dpr,
+        ) {
+            Ok(out) => match rgba_buffer_to_render_image(&out.image) {
+                Some(image) => MathRenderResult::Ready(MathRenderSlot {
+                    image,
+                    width_pt: out.width_pt as f32,
+                    ascent_pt: out.ascent_pt as f32,
+                    descent_pt: out.descent_pt as f32,
+                }),
+                None => MathRenderResult::Error,
+            },
+            Err(_) => MathRenderResult::Error,
+        };
 
         if let Ok(mut guard) = cache.write() {
             if guard.len() > 256 {
@@ -248,10 +295,10 @@ pub fn render_math_cached(
         }
         rendered
     }
-    #[cfg(not(feature = "preview-engine"))]
+    #[cfg(target_arch = "wasm32")]
     {
-        let _ = (display, font_size_pt, color);
-        None
+        let _ = (display, font_size_pt, color, norm_dpr);
+        MathRenderResult::Pending
     }
 }
 
@@ -261,7 +308,7 @@ pub fn render_pdf_page(
     page_index: usize,
     scale: f32,
 ) -> Option<PdfPreviewPage> {
-    #[cfg(feature = "preview-engine")]
+    #[cfg(not(target_arch = "wasm32"))]
     {
         let page_count = doc.renderer.page_count();
         if page_count == 0 {
@@ -281,7 +328,7 @@ pub fn render_pdf_page(
             height_pt: buf.logical_height,
         })
     }
-    #[cfg(not(feature = "preview-engine"))]
+    #[cfg(target_arch = "wasm32")]
     {
         if doc.page_count == 0 {
             return None;
@@ -292,21 +339,19 @@ pub fn render_pdf_page(
         {
             return provider.render_pdf_page(&doc.bytes, idx, scale);
         }
-        // Honest fallback: without `preview-engine` or a registered host `PdfPageProvider`,
-        // return `None` so `attachment_body` renders a clean file card rather than a fake box.
         None
     }
 }
 
 /// Construct an [`EmbeddedPdfDocument`] from raw PDF bytes.
 pub fn parse_pdf_renderer(bytes: &[u8]) -> Option<EmbeddedPdfDocument> {
-    #[cfg(feature = "preview-engine")]
+    #[cfg(not(target_arch = "wasm32"))]
     {
         HayroPdfRenderer::from_bytes(bytes.to_vec())
             .ok()
             .map(|renderer| EmbeddedPdfDocument { renderer })
     }
-    #[cfg(not(feature = "preview-engine"))]
+    #[cfg(target_arch = "wasm32")]
     {
         if !bytes.starts_with(b"%PDF-") {
             return None;
@@ -328,138 +373,143 @@ impl super::FlowPass<'_> {
         use super::{
             BlockBody, CARD_BLOCK_MARGIN, FlowKind, FlowRect, InlineAlign, InlineStyle, Prim,
         };
-        use crate::theme::{FONT_SANS, TYPOGRAPHY};
+        use crate::theme::{FONT_CODE, FONT_SANS, TYPOGRAPHY};
 
-        let pad_x = 16.0;
-        let pad_y = 14.0;
+        // Match BlockSuite `latex/src/styles.ts:5-40`: `padding: 10px 24px`, `border-radius: 4px`,
+        // transparent at rest with zero permanent background or border (hover tint is drawn in
+        // `overlays/paint_page`).
+        let pad_x = 24.0;
+        let pad_y = 10.0;
         let inner = (width - 2.0 * pad_x).max(1.0);
         let empty = latex.trim().is_empty();
-        if !empty
-            && let Some(math) = render_math_cached(latex, true, 18.0, self.palette.text_primary)
-        {
-            let natural_w = math.width_pt.max(1.0);
-            let natural_h = (math.ascent_pt + math.descent_pt).max(18.0);
-            let scale = if natural_w > inner {
-                inner / natural_w
-            } else {
-                1.0
-            };
-            let img_w = (natural_w * scale).round().max(1.0);
-            let img_h = (natural_h * scale).round().max(1.0);
-            let height = (img_h + 2.0 * pad_y).max(56.0);
-            let img_x = ((width - img_w) / 2.0).floor().max(pad_x);
-            let img_y = ((height - img_h) / 2.0).floor().max(pad_y);
-            return BlockBody {
-                kind: FlowKind::Latex,
-                width,
-                height,
-                margin_top: CARD_BLOCK_MARGIN,
-                margin_bottom: CARD_BLOCK_MARGIN,
-                plain: latex.to_string(),
-                prims: vec![
-                    Prim::Quad {
-                        rect: FlowRect::new(0.0, 0.0, width, height),
-                        fill: Some(self.palette.background_secondary),
-                        border: Some(self.palette.border),
-                        radius: 8.0,
-                        dashed: false,
-                    },
-                    Prim::Image {
-                        rect: FlowRect::new(img_x, img_y, img_w, img_h),
-                        image: math.image,
-                    },
-                ],
-                text: None,
-                prefix: None,
-                code_scroll: None,
-                pdf_controls: None,
-                table_cells: Vec::new(),
-            };
-        }
-        if !empty {
-            let (mw, mh, mut math_prims) = super::math_layout::layout_math_2d(
-                latex,
-                18.0,
-                self.palette.text_primary,
-                self.window,
+        if empty {
+            let style = InlineStyle::new(
+                FONT_SANS,
+                TYPOGRAPHY.font_xs_px,
+                500.0,
+                self.palette.text_secondary,
             );
-            let height = (mh + 2.0 * pad_y).max(56.0);
-            let offset_x = ((width - mw) / 2.0).floor().max(pad_x);
-            let offset_y = ((height - mh) / 2.0).floor().max(pad_y);
-            for prim in &mut math_prims {
-                match prim {
-                    Prim::Text { x, y, .. } => {
-                        *x += offset_x;
-                        *y += offset_y;
-                    }
-                    Prim::Quad { rect, .. }
-                    | Prim::Image { rect, .. }
-                    | Prim::Icon { rect, .. } => {
-                        *rect = rect.translated(offset_x, offset_y);
-                    }
-                    _ => {}
-                }
-            }
-            let mut prims = Vec::with_capacity(math_prims.len() + 1);
-            prims.push(Prim::Quad {
-                rect: FlowRect::new(0.0, 0.0, width, height),
-                fill: Some(self.palette.background_secondary),
-                border: Some(self.palette.border),
-                radius: 8.0,
-                dashed: false,
-            });
-            prims.extend(math_prims);
+            let layout = self.plain_inline("Equation", style, inner, 20.0, InlineAlign::Center);
+            let height = (layout.height() + 2.0 * pad_y).max(40.0);
+            let text_y = ((height - layout.height()) / 2.0).floor().max(pad_y);
             return BlockBody {
                 kind: FlowKind::Latex,
                 width,
                 height,
                 margin_top: CARD_BLOCK_MARGIN,
                 margin_bottom: CARD_BLOCK_MARGIN,
-                plain: latex.to_string(),
-                prims,
-                text: None,
-                prefix: None,
-                code_scroll: None,
-                pdf_controls: None,
-                table_cells: Vec::new(),
-            };
-        }
-        let style = InlineStyle::new(
-            FONT_SANS,
-            TYPOGRAPHY.font_sm_px,
-            400.0,
-            self.palette.text_secondary,
-        );
-        let layout = self.plain_inline("Add an equation", style, inner, 22.0, InlineAlign::Center);
-        let height = (layout.height() + 2.0 * pad_y).max(52.0);
-        let text_y = ((height - layout.height()) / 2.0).floor().max(pad_y);
-        BlockBody {
-            kind: FlowKind::Latex,
-            width,
-            height,
-            margin_top: CARD_BLOCK_MARGIN,
-            margin_bottom: CARD_BLOCK_MARGIN,
-            plain: "Add an equation".to_string(),
-            prims: vec![
-                Prim::Quad {
-                    rect: FlowRect::new(0.0, 0.0, width, height),
-                    fill: Some(self.palette.background_secondary),
-                    border: Some(self.palette.border),
-                    radius: 8.0,
-                    dashed: false,
-                },
-                Prim::Text {
+                plain: "Equation".to_string(),
+                prims: vec![Prim::Text {
                     x: pad_x,
                     y: text_y,
                     layout,
                     clip: Some(FlowRect::new(pad_x, pad_y, inner, height - 2.0 * pad_y)),
-                },
-            ],
-            text: None,
-            prefix: None,
-            code_scroll: None,
-            pdf_controls: None,
-            table_cells: Vec::new(),
+                }],
+                text: None,
+                prefix: None,
+                code_scroll: None,
+                pdf_controls: None,
+                table_cells: Vec::new(),
+            };
+        }
+
+        let dpr = self.window.scale_factor();
+        match render_math_cached(latex, true, 18.0, self.palette.text_primary, dpr) {
+            MathRenderResult::Ready(math) => {
+                let natural_w = math.width_pt.max(1.0);
+                let natural_h = (math.ascent_pt + math.descent_pt).max(18.0);
+                let scale = if natural_w > inner {
+                    inner / natural_w
+                } else {
+                    1.0
+                };
+                let img_w = (natural_w * scale).round().max(1.0);
+                let img_h = (natural_h * scale).round().max(1.0);
+                let height = (img_h + 2.0 * pad_y).max(40.0);
+                let img_x = ((width - img_w) / 2.0).floor().max(pad_x);
+                let img_y = ((height - img_h) / 2.0).floor().max(pad_y);
+                BlockBody {
+                    kind: FlowKind::Latex,
+                    width,
+                    height,
+                    margin_top: CARD_BLOCK_MARGIN,
+                    margin_bottom: CARD_BLOCK_MARGIN,
+                    plain: latex.to_string(),
+                    prims: vec![Prim::Image {
+                        rect: FlowRect::new(img_x, img_y, img_w, img_h),
+                        image: math.image,
+                    }],
+                    text: None,
+                    prefix: None,
+                    code_scroll: None,
+                    pdf_controls: None,
+                    table_cells: Vec::new(),
+                }
+            }
+            MathRenderResult::Error => {
+                let err_color = self
+                    .input
+                    .theme
+                    .css_var("--affine-v2-text-highlight-fg-red")
+                    .or_else(|| self.input.theme.css_var("--affine-error-color"))
+                    .unwrap_or_else(|| ui::rgb(0xeb4335).into());
+                let style = InlineStyle::new(FONT_SANS, TYPOGRAPHY.font_xs_px, 500.0, err_color);
+                let layout =
+                    self.plain_inline("Error equation", style, inner, 20.0, InlineAlign::Center);
+                let height = (layout.height() + 2.0 * pad_y).max(40.0);
+                let text_y = ((height - layout.height()) / 2.0).floor().max(pad_y);
+                BlockBody {
+                    kind: FlowKind::Latex,
+                    width,
+                    height,
+                    margin_top: CARD_BLOCK_MARGIN,
+                    margin_bottom: CARD_BLOCK_MARGIN,
+                    plain: "Error equation".to_string(),
+                    prims: vec![Prim::Text {
+                        x: pad_x,
+                        y: text_y,
+                        layout,
+                        clip: Some(FlowRect::new(pad_x, pad_y, inner, height - 2.0 * pad_y)),
+                    }],
+                    text: None,
+                    prefix: None,
+                    code_scroll: None,
+                    pdf_controls: None,
+                    table_cells: Vec::new(),
+                }
+            }
+            MathRenderResult::Pending => {
+                // Async worker calculation in progress: keep clean unframed source text with
+                // zero box, zero border, and never "Error equation".
+                let style = InlineStyle::new(
+                    FONT_CODE,
+                    TYPOGRAPHY.font_xs_px,
+                    400.0,
+                    self.palette.text_secondary,
+                );
+                let layout = self.plain_inline(latex, style, inner, 20.0, InlineAlign::Center);
+                let height = (layout.height() + 2.0 * pad_y).max(40.0);
+                let text_y = ((height - layout.height()) / 2.0).floor().max(pad_y);
+                BlockBody {
+                    kind: FlowKind::Latex,
+                    width,
+                    height,
+                    margin_top: CARD_BLOCK_MARGIN,
+                    margin_bottom: CARD_BLOCK_MARGIN,
+                    plain: latex.to_string(),
+                    prims: vec![Prim::Text {
+                        x: pad_x,
+                        y: text_y,
+                        layout,
+                        clip: Some(FlowRect::new(pad_x, pad_y, inner, height - 2.0 * pad_y)),
+                    }],
+                    text: None,
+                    prefix: None,
+                    code_scroll: None,
+                    pdf_controls: None,
+                    table_cells: Vec::new(),
+                }
+            }
         }
     }
 
@@ -522,98 +572,6 @@ impl super::FlowPass<'_> {
                     x: pad,
                     y: id_y,
                     layout: id,
-                    clip: None,
-                },
-            ],
-            text: None,
-            prefix: None,
-            code_scroll: None,
-            pdf_controls: None,
-            table_cells: Vec::new(),
-        }
-    }
-
-    pub(super) fn surface_ref_body(
-        &mut self,
-        reference: &str,
-        ref_flavour: &str,
-        caption: &str,
-        width: f32,
-    ) -> super::BlockBody {
-        use super::{
-            BlockBody, CARD_BLOCK_MARGIN, FlowKind, FlowRect, InlineAlign, InlineStyle, Prim,
-            inline::truncate_to_width,
-        };
-        use crate::theme::{FONT_CODE, FONT_SANS, TYPOGRAPHY};
-        let card_h = 84.0;
-        let pad = 14.0;
-        let inner_w = (width - pad * 2.0 - 32.0).max(40.0);
-        let title = if caption.is_empty() {
-            reference
-        } else {
-            caption
-        };
-        let title_style = InlineStyle::new(
-            FONT_SANS,
-            TYPOGRAPHY.font_sm_px,
-            600.0,
-            self.palette.text_primary,
-        );
-        let sub_style = InlineStyle::new(
-            FONT_CODE,
-            TYPOGRAPHY.font_xs_px,
-            400.0,
-            self.palette.text_secondary,
-        );
-        let title_str = truncate_to_width(self.window, title, &title_style, inner_w)
-            .text
-            .to_string();
-        let sub = format!("Surface ref  {ref_flavour}  {reference}");
-        let sub_str = truncate_to_width(self.window, &sub, &sub_style, inner_w)
-            .text
-            .to_string();
-        BlockBody {
-            kind: FlowKind::SurfaceRef,
-            width,
-            height: card_h,
-            margin_top: CARD_BLOCK_MARGIN,
-            margin_bottom: CARD_BLOCK_MARGIN,
-            plain: title.to_string(),
-            prims: vec![
-                Prim::Quad {
-                    rect: FlowRect::new(0.0, 0.0, width, card_h),
-                    fill: Some(self.palette.background_secondary),
-                    border: Some(self.palette.card_border),
-                    radius: 8.0,
-                    dashed: false,
-                },
-                Prim::Icon {
-                    rect: FlowRect::new(pad, 16.0, 20.0, 20.0),
-                    icon: crate::theme::IconPaint::named("EdgelessIcon"),
-                    color: self.palette.icon,
-                },
-                Prim::Text {
-                    x: pad + 28.0,
-                    y: 14.0,
-                    layout: self.plain_inline(
-                        &title_str,
-                        title_style,
-                        inner_w,
-                        22.0,
-                        InlineAlign::Left,
-                    ),
-                    clip: None,
-                },
-                Prim::Text {
-                    x: pad + 28.0,
-                    y: 42.0,
-                    layout: self.plain_inline(
-                        &sub_str,
-                        sub_style,
-                        inner_w,
-                        18.0,
-                        InlineAlign::Left,
-                    ),
                     clip: None,
                 },
             ],
